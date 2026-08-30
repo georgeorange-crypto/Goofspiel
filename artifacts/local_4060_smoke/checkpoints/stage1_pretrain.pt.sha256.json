@@ -1,0 +1,29 @@
+{
+  "path": "artifacts\\local_4060_smoke\\checkpoints\\stage1_pretrain.pt",
+  "sha256": "6e4051537a24e9338073d62740a15e3db2e5d43ea191a1075627bcee3c0185fb",
+  "metadata": {
+    "checkpoint_id": "stage1_pretrain",
+    "training_stage": "P1_PRETRAIN",
+    "global_step": 20,
+    "policy_version": 0,
+    "config": {
+      "steps": 20,
+      "batch_size": 8,
+      "n_cards": 3,
+      "lr": 0.0003,
+      "world_size": 1
+    },
+    "metrics": {
+      "loss_last": 0.11196357011795044,
+      "immediate_joint_outcome_loss": 0.04810316115617752,
+      "player_swap_loss": 0.0036540564615279436,
+      "future_opponent_behaviour_loss": 0.8721336126327515,
+      "masked_history_action_loss": 0.004699192009866238,
+      "style_contrastive_loss": 1.9977047443389893,
+      "known_transition_samples": 8.0
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788114957.6343255
+  }
+}

@@ -1,0 +1,127 @@
+{
+  "benchmark_version": "goofspiel.benchmark.v1",
+  "schema_version": "goofspiel.training.v1",
+  "profile": {
+    "name": "QUICK",
+    "seeds": [
+      1,
+      2,
+      3
+    ],
+    "num_games": 8,
+    "include_e7": false
+  },
+  "arenas": {
+    "E0_MATHEMATICAL_CORRECTNESS": {
+      "matrix_matching_pennies_gap": 0.0,
+      "passed": true
+    },
+    "E1_EXACT_SMALL_N": {
+      "risk_by_n": {
+        "1": "GREEN",
+        "2": "GREEN",
+        "3": "GREEN",
+        "4": "GREEN",
+        "5": "GREEN"
+      },
+      "states_by_n": {
+        "1": 2,
+        "2": 10,
+        "3": 56,
+        "4": 346,
+        "5": 2252
+      }
+    },
+    "E2_N13_ROBUST": {
+      "mean_score_diff": 29.125,
+      "worst_seed_score_diff": 21.875,
+      "num_seeds": 3.0
+    },
+    "E3_OPPONENT_MODELING": {
+      "rows": [
+        {
+          "benchmark": "uniform_reference",
+          "nll": 2.5649493574615367,
+          "brier": 0.9230769230769231,
+          "ece": 0.0,
+          "switch_delay": 0.0,
+          "gate": "PASS_REFERENCE"
+        }
+      ]
+    },
+    "E4_ADAPTIVE_SAFETY": {
+      "rows": [
+        {
+          "benchmark": "safety_reference",
+          "adaptive_gain": 0.0,
+          "oracle_gain": 0.0,
+          "risk_increase": 0.0,
+          "gate": "PASS_REFERENCE"
+        }
+      ]
+    },
+    "E5_SEARCH_COMPUTE": {
+      "rows": [
+        {
+          "method": "SM_MCTS",
+          "simulations": 128,
+          "runtime_ms": 26.402999996207654,
+          "quality_score": 1.997638888657093,
+          "exact_leaf_hits": 0
+        },
+        {
+          "method": "SM_MCTS",
+          "simulations": 512,
+          "runtime_ms": 18.82159999513533,
+          "quality_score": 1.997638888657093,
+          "exact_leaf_hits": 0
+        },
+        {
+          "method": "GT_CFR",
+          "iterations": 256,
+          "runtime_ms": 72.42099999712082,
+          "quality_score": 2.9994097221642733
+        }
+      ]
+    },
+    "E6_GENERALIZATION": {
+      "rows": [
+        {
+          "n": 3,
+          "robust_score": 0.375,
+          "exploitability": 0.0,
+          "opp_nll": 1.0986122886681098
+        },
+        {
+          "n": 5,
+          "robust_score": 6.125,
+          "exploitability": 0.0,
+          "opp_nll": 1.6094379124341003
+        },
+        {
+          "n": 9,
+          "robust_score": 15.208333333333334,
+          "exploitability": 0.0,
+          "opp_nll": 2.1972245773362196
+        },
+        {
+          "n": 13,
+          "robust_score": 23.583333333333332,
+          "exploitability": 0.0,
+          "opp_nll": 2.5649493574615367
+        }
+      ]
+    }
+  },
+  "hard_gates": {
+    "G0_integrity": true,
+    "G1_exact_regression": true,
+    "G2_exploitability": true,
+    "G3_historical": true,
+    "G4_regression_suite": true,
+    "G5_opponent_calibration": true,
+    "G6_adaptive_safety": true,
+    "G7_numerical_performance": true
+  },
+  "promotion_decision": "PROMOTE_CANDIDATE"
+}

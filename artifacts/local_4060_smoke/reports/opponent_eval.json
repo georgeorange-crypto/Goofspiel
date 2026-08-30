@@ -1,0 +1,37 @@
+{
+  "opponent_model_usable": true,
+  "gate": "CALIBRATED_CURRICULUM",
+  "calibration": {
+    "sessions": 20,
+    "rounds": 60,
+    "nll": 0.5972531564093516,
+    "ece": 0.0,
+    "uniform_bucket_accuracy": 1.0,
+    "oracle_accuracy": 0.6666666666666666,
+    "oracle_gain": 0.3333333333333333,
+    "switch_delay": 1.0
+  },
+  "opponent_curriculum": [
+    {
+      "regime_id": "uniform_random",
+      "description": "uniform legal-card sampling",
+      "expected_switch_delay": 0.0
+    },
+    {
+      "regime_id": "high_card_pressure",
+      "description": "prefers highest legal card on large stakes",
+      "expected_switch_delay": 1.0
+    },
+    {
+      "regime_id": "low_card_saver",
+      "description": "prefers lowest legal card on low stakes",
+      "expected_switch_delay": 1.0
+    }
+  ],
+  "required": {
+    "ece_max": 0.05,
+    "nll_better_than_uniform": false,
+    "switch_benchmark": "curriculum_gate"
+  },
+  "session_path": "artifacts\\local_4060_smoke\\adaptive\\opponent_sessions.jsonl"
+}

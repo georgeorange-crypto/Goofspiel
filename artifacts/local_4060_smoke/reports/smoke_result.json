@@ -1,0 +1,192 @@
+{
+  "ok": true,
+  "device": "cuda",
+  "n_cards": 3,
+  "steps": 20,
+  "batch_size": 8,
+  "num_corpus_games": 8,
+  "event_log": "artifacts\\local_4060_smoke\\events\\training_smoke.jsonl",
+  "event_count": 12,
+  "stage0": {
+    "ok": true,
+    "checks": {
+      "environment_contract": true,
+      "pure_transition_contract": true,
+      "exact_complexity_estimator": true,
+      "reference_matrix_solver": true,
+      "jsonl_schema_store": true,
+      "teacher_priority_contract": true
+    },
+    "errors": []
+  },
+  "build_corpus": {
+    "games": 8,
+    "samples": 72
+  },
+  "stage1_pretrain": {
+    "stage": "P1_PRETRAIN",
+    "steps": 20,
+    "metrics": {
+      "loss_last": 0.11196357011795044,
+      "immediate_joint_outcome_loss": 0.04810316115617752,
+      "player_swap_loss": 0.0036540564615279436,
+      "future_opponent_behaviour_loss": 0.8721336126327515,
+      "masked_history_action_loss": 0.004699192009866238,
+      "style_contrastive_loss": 1.9977047443389893,
+      "known_transition_samples": 8.0
+    },
+    "checkpoint": "artifacts\\local_4060_smoke\\checkpoints\\stage1_pretrain.pt"
+  },
+  "stage2_semi_supervised": {
+    "stage": "P2_SEMI_SUPERVISED",
+    "steps": 20,
+    "metrics": {
+      "teacher_samples": 20.0,
+      "filtered_teacher_rejections": 0.0,
+      "exact_search_cfr_ema_ensemble": 1.0,
+      "exact_anchor_samples": 20.0,
+      "pseudo_accept_rate": 1.0
+    },
+    "checkpoint": null
+  },
+  "stage3_sft": {
+    "stage": "P3_STRATEGIC_SFT",
+    "steps": 20,
+    "metrics": {
+      "loss_last": 0.025771811604499817,
+      "exact_sft_samples": 160.0,
+      "search_cfr_sft_samples": 160.0,
+      "opponent_behaviour_sft_samples": 160.0,
+      "high_confidence_pseudo_sft_samples": 160.0,
+      "pretraining_anchors_retained": 1.0
+    },
+    "checkpoint": "artifacts\\local_4060_smoke\\checkpoints\\stage3_sft.pt"
+  },
+  "stage4_robust_rl": {
+    "stage": "P4_ROBUST_RL",
+    "steps": 20,
+    "metrics": {
+      "q_loss_last": 0.08394675701856613,
+      "actor_loss_last": -0.0007810541428625584,
+      "policy_gradient_loss_last": -0.03601239621639252,
+      "entropy_last": 0.5957808494567871,
+      "selfplay_trajectories": 160.0,
+      "selfplay_transitions": 480.0,
+      "replay_samples": 160.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0,
+      "promotion_candidate": 1.0,
+      "replay_persisted_samples": 160.0
+    },
+    "checkpoint": "artifacts\\local_4060_smoke\\checkpoints\\stage4_robust_rl.pt"
+  },
+  "stage5_adaptive": {
+    "stage": "P5_ADAPTIVE",
+    "steps": 20,
+    "metrics": {
+      "opponent_model_usable": 1.0,
+      "opponent_sessions": 20.0,
+      "opponent_rounds": 60.0,
+      "opponent_nll": 0.5972531564093516,
+      "opponent_ece": 0.0,
+      "opponent_regimes": 3.0,
+      "oracle_gain": 0.3333333333333333,
+      "switch_delay": 1.0
+    },
+    "checkpoint": null
+  },
+  "stage6_league": {
+    "stage": "P6_LEAGUE",
+    "steps": 1,
+    "metrics": {
+      "robust_count": 1.0,
+      "aggressive_count": 1.0,
+      "exploiter_count": 1.0,
+      "league_agents": 3.0,
+      "crossplay_pairs": 9.0,
+      "pfsp_weights": 3.0
+    },
+    "checkpoint": null
+  },
+  "stage7_redteam": {
+    "stage": "P7_REDTEAM",
+    "steps": 1,
+    "metrics": {
+      "failures": 3.0,
+      "corrections": 3.0,
+      "attack_families": 1.0,
+      "teacher_relabels": 3.0,
+      "focused_correction_steps": 3.0,
+      "original_attack_regression_passed": 1.0,
+      "general_regression_passed": 1.0
+    },
+    "checkpoint": null
+  },
+  "evaluation": {
+    "reports": [
+      {
+        "name": "bot_matchup",
+        "metrics": {
+          "games": 8.0,
+          "mean_score_diff": 19.75,
+          "win_rate": 0.625,
+          "draw_rate": 0.0
+        },
+        "details": {
+          "bot_a": "heuristic",
+          "bot_b": "random",
+          "n_cards": 13
+        },
+        "passed": true
+      },
+      {
+        "name": "exact_feasibility_sweep",
+        "metrics": {
+          "max_n": 13.0
+        },
+        "details": {
+          "risk_by_n": {
+            "1": "GREEN",
+            "2": "GREEN",
+            "3": "GREEN",
+            "4": "GREEN",
+            "5": "GREEN",
+            "6": "GREEN",
+            "7": "YELLOW",
+            "8": "YELLOW",
+            "9": "ORANGE",
+            "10": "ORANGE",
+            "11": "ORANGE",
+            "12": "RED",
+            "13": "RED"
+          },
+          "states_by_n": {
+            "1": 2,
+            "2": 10,
+            "3": 56,
+            "4": 346,
+            "5": 2252,
+            "6": 15184,
+            "7": 104960,
+            "8": 739162,
+            "9": 5280932,
+            "10": 38165260,
+            "11": 278415920,
+            "12": 2046924400,
+            "13": 15148345760
+          }
+        },
+        "passed": true
+      }
+    ],
+    "benchmark_report": {
+      "summary_json": "artifacts\\local_4060_smoke\\evaluation\\reports\\quick\\summary.json",
+      "summary_md": "artifacts\\local_4060_smoke\\evaluation\\reports\\quick\\summary.md",
+      "main_table": "artifacts\\local_4060_smoke\\evaluation\\reports\\quick\\main_robust_table.csv",
+      "search_table": "artifacts\\local_4060_smoke\\evaluation\\reports\\quick\\search_table.csv",
+      "adaptive_table": "artifacts\\local_4060_smoke\\evaluation\\reports\\quick\\adaptive_table.csv",
+      "opponent_table": "artifacts\\local_4060_smoke\\evaluation\\reports\\quick\\opponent_table.csv",
+      "generalization_table": "artifacts\\local_4060_smoke\\evaluation\\reports\\quick\\generalization_table.csv"
+    }
+  }
+}

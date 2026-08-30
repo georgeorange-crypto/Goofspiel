@@ -1,0 +1,24 @@
+{
+  "attacks": [
+    {
+      "failure_id": "redteam_attack_0_10538e4670294197bd0958d079578ee9",
+      "state_hash": "f2ccaf9997f8b12649625c664951d814b863a10d4b1138f4c3ea48a734d5c09a",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    },
+    {
+      "failure_id": "redteam_attack_1_d17a36f1c0b64dfd8551d33739c0f7f9",
+      "state_hash": "7b28559ce76d170b20ffee2934155504567a9c9ac98097fda137241f83aef2e2",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    },
+    {
+      "failure_id": "redteam_attack_2_a875c258b4ca4ff68adaaeb32189182e",
+      "state_hash": "25f05d45cd2528eb3d3cfd42d07259f3ca5c598fae8423f07b3fc132ba94fc1f",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    }
+  ],
+  "corrections": 3,
+  "focused_correction": "artifacts\\local_4060_smoke\\redteam\\focused_correction_report.json"
+}

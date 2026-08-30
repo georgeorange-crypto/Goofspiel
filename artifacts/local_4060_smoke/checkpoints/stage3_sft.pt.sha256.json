@@ -1,0 +1,28 @@
+{
+  "path": "artifacts\\local_4060_smoke\\checkpoints\\stage3_sft.pt",
+  "sha256": "af6fed43eeb13813a9c20e7dbd806f0534413a6a2664d0429bd9c9b34dc74396",
+  "metadata": {
+    "checkpoint_id": "stage3_sft",
+    "training_stage": "P3_STRATEGIC_SFT",
+    "global_step": 20,
+    "policy_version": 1,
+    "config": {
+      "steps": 20,
+      "batch_size": 8,
+      "n_cards": 3,
+      "lr": 0.0002,
+      "world_size": 1
+    },
+    "metrics": {
+      "loss_last": 0.025771811604499817,
+      "exact_sft_samples": 160.0,
+      "search_cfr_sft_samples": 160.0,
+      "opponent_behaviour_sft_samples": 160.0,
+      "high_confidence_pseudo_sft_samples": 160.0,
+      "pretraining_anchors_retained": 1.0
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788114963.398241
+  }
+}

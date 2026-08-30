@@ -1,0 +1,10 @@
+artifact_dir: artifacts/local_4060_smoke
+seed: 1
+stage: smoke_pipeline
+steps: 20
+batch_size: 8
+device: cuda
+num_corpus_games: 8
+n_cards: 3
+dry_run: False
+extra: {}

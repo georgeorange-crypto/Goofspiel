@@ -1,0 +1,31 @@
+{
+  "path": "artifacts\\local_4060_smoke\\checkpoints\\stage4_robust_rl.pt",
+  "sha256": "87189a351583ed6fa5ec0ff48347bd46bc583999b031f3e20f69443ac36e32c1",
+  "metadata": {
+    "checkpoint_id": "stage4_robust_rl",
+    "training_stage": "P4_ROBUST_RL",
+    "global_step": 20,
+    "policy_version": 2,
+    "config": {
+      "steps": 20,
+      "batch_size": 8,
+      "n_cards": 3,
+      "lr": 0.0001,
+      "world_size": 1
+    },
+    "metrics": {
+      "q_loss_last": 0.08394675701856613,
+      "actor_loss_last": -0.0007810541428625584,
+      "policy_gradient_loss_last": -0.03601239621639252,
+      "entropy_last": 0.5957808494567871,
+      "selfplay_trajectories": 160.0,
+      "selfplay_transitions": 480.0,
+      "replay_samples": 160.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788114993.1424708
+  }
+}

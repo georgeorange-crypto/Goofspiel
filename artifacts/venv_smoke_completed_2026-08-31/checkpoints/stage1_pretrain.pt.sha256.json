@@ -1,0 +1,29 @@
+{
+  "path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\stage1_pretrain.pt",
+  "sha256": "e3e4efafcba160bbcbffaf654740ac61d388e0662c48de5088d0817740e48ae5",
+  "metadata": {
+    "checkpoint_id": "stage1_pretrain",
+    "training_stage": "P1_PRETRAIN",
+    "global_step": 3,
+    "policy_version": 0,
+    "config": {
+      "steps": 3,
+      "batch_size": 2,
+      "n_cards": 3,
+      "lr": 0.0003,
+      "world_size": 1
+    },
+    "metrics": {
+      "loss_last": 0.36179178953170776,
+      "immediate_joint_outcome_loss": 0.26642370223999023,
+      "player_swap_loss": 0.028689708560705185,
+      "future_opponent_behaviour_loss": 1.0790417194366455,
+      "masked_history_action_loss": 1.0032262802124023,
+      "style_contrastive_loss": 1.9916975498199463,
+      "known_transition_samples": 2.0
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788109956.462405
+  }
+}

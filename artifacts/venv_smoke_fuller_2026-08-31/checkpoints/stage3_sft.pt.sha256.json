@@ -1,0 +1,23 @@
+{
+  "path": "artifacts\\venv_smoke_fuller_2026-08-31\\checkpoints\\stage3_sft.pt",
+  "sha256": "259b754bd90ac346e7b80a4cd80fbf3845b85236785d15e200092d8d8ddfd550",
+  "metadata": {
+    "checkpoint_id": "stage3_sft",
+    "training_stage": "P3_STRATEGIC_SFT",
+    "global_step": 1,
+    "policy_version": 1,
+    "config": {
+      "steps": 1,
+      "batch_size": 2,
+      "n_cards": 3,
+      "lr": 0.0002,
+      "world_size": 1
+    },
+    "metrics": {
+      "loss_last": 0.2498776912689209
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788107714.4934938
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "target_n": 3,
+  "warmup_n": 3,
+  "ramp_every": 3,
+  "probes": [
+    {
+      "step": 0,
+      "n_cards": 3,
+      "horizon": 3,
+      "reason": "target_n_reached"
+    },
+    {
+      "step": 1,
+      "n_cards": 3,
+      "horizon": 3,
+      "reason": "target_n_reached"
+    },
+    {
+      "step": 2,
+      "n_cards": 3,
+      "horizon": 3,
+      "reason": "target_n_reached"
+    }
+  ]
+}

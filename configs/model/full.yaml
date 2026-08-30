@@ -1,0 +1,24 @@
+model:
+  name: goofspiel_full
+  max_cards: 13
+  d_model: 192
+  transformer:
+    layers: 4
+    heads: 6
+    ffn_dim: 768
+    dropout: 0.05
+  relational_gnn:
+    hidden_dim: 128
+    layers: 3
+    heads: 4
+  matrix_cnn:
+    pair_dim: 96
+    hidden_dim: 128
+    residual_blocks: 4
+  opponent_memory:
+    lstm_layers: 2
+    hidden_dim: 192
+    mamba_hidden_dim: 192
+  heads:
+    q_ensemble_heads: 4
+    outcome_bins: 201

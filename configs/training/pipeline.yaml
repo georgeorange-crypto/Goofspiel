@@ -1,0 +1,21 @@
+training_pipeline:
+  stage0_verify:
+    enabled: true
+  pretrain:
+    enabled: true
+  semi_supervised:
+    enabled: true
+  strategic_sft:
+    enabled: true
+  robust_posttrain:
+    enabled: true
+  opponent_posttrain:
+    enabled: true
+  league:
+    enabled: true
+  redteam:
+    enabled: true
+  reanalysis:
+    enabled: true
+  distillation:
+    enabled: true

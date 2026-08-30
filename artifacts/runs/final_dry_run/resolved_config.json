@@ -1,0 +1,12 @@
+{
+  "artifact_dir": "artifacts\\runs\\final_dry_run",
+  "seed": 1,
+  "stage": "stage0_verify",
+  "steps": 10,
+  "batch_size": 8,
+  "device": "cpu",
+  "num_corpus_games": 32,
+  "n_cards": 5,
+  "dry_run": true,
+  "extra": {}
+}

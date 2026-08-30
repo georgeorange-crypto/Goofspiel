@@ -1,0 +1,23 @@
+{
+  "path": "artifacts\\venv_smoke_fuller_2026-08-31\\checkpoints\\stage1_pretrain.pt",
+  "sha256": "be417dffe48c8adf8e67a3ead161e16336fb3dbf16c11ab8dcf5ee6ddda645ab",
+  "metadata": {
+    "checkpoint_id": "stage1_pretrain",
+    "training_stage": "P1_PRETRAIN",
+    "global_step": 1,
+    "policy_version": 0,
+    "config": {
+      "steps": 1,
+      "batch_size": 2,
+      "n_cards": 3,
+      "lr": 0.0003,
+      "world_size": 1
+    },
+    "metrics": {
+      "loss_q_last": 0.13333936035633087
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788107713.766272
+  }
+}

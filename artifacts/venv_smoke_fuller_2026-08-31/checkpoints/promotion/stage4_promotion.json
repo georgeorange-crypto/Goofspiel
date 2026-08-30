@@ -1,0 +1,27 @@
+{
+  "decision": "PROMOTE_CANDIDATE",
+  "gates": {
+    "stage0_ok": true,
+    "replay_samples": true,
+    "q_loss_finite": true,
+    "entropy_floor": true
+  },
+  "metrics": {
+    "q_loss_last": 0.08127725124359131,
+    "actor_loss_last": -0.000274536432698369,
+    "policy_gradient_loss_last": -0.06605264544487,
+    "entropy_last": 0.5970086455345154,
+    "selfplay_trajectories": 2.0,
+    "selfplay_transitions": 6.0,
+    "replay_samples": 2.0,
+    "target_network_ema": 0.995,
+    "curriculum_final_n": 3.0
+  },
+  "thresholds": {
+    "min_replay_samples": 1,
+    "max_q_loss": 10.0,
+    "min_entropy": 0.05,
+    "require_stage0": true
+  },
+  "notes": []
+}

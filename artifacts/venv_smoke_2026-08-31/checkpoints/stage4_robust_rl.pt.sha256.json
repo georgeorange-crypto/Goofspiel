@@ -1,0 +1,24 @@
+{
+  "path": "artifacts\\venv_smoke_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+  "sha256": "ac409d208644839732bf1e1472d67189de9516bd24b5da3039681889bf8c6778",
+  "metadata": {
+    "checkpoint_id": "stage4_robust_rl",
+    "training_stage": "P4_ROBUST_RL",
+    "global_step": 1,
+    "policy_version": 2,
+    "config": {
+      "steps": 1,
+      "batch_size": 2,
+      "n_cards": 3,
+      "lr": 0.0001,
+      "world_size": 1
+    },
+    "metrics": {
+      "q_loss_last": 0.15178550779819489,
+      "actor_loss_last": -8.868605073075742e-05
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788106000.0044944
+  }
+}

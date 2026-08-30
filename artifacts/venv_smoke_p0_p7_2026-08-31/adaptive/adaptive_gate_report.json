@@ -1,0 +1,17 @@
+{
+  "opponent_model_usable": true,
+  "gate": "CALIBRATED_BOOTSTRAP",
+  "calibration": {
+    "sessions": 1,
+    "rounds": 3,
+    "nll": 0.5972531564093516,
+    "ece": 0.0,
+    "uniform_bucket_accuracy": 1.0
+  },
+  "required": {
+    "ece_max": 0.05,
+    "nll_better_than_uniform": false,
+    "switch_benchmark": "bootstrap_not_required"
+  },
+  "session_path": "artifacts\\venv_smoke_p0_p7_2026-08-31\\adaptive\\opponent_sessions.jsonl"
+}

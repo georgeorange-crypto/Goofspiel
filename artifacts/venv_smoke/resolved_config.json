@@ -1,0 +1,12 @@
+{
+  "artifact_dir": "artifacts\\venv_smoke",
+  "seed": 1,
+  "stage": "smoke_pipeline",
+  "steps": 1,
+  "batch_size": 2,
+  "device": "cuda",
+  "num_corpus_games": 2,
+  "n_cards": 3,
+  "dry_run": false,
+  "extra": {}
+}

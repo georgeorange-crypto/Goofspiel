@@ -1,0 +1,12 @@
+{
+  "artifact_dir": "artifacts\\stage4_selfplay_n13_direct_2026-08-31",
+  "seed": 1,
+  "stage": "stage4_robust_rl",
+  "steps": 1,
+  "batch_size": 1,
+  "device": "cuda",
+  "num_corpus_games": 32,
+  "n_cards": 13,
+  "dry_run": false,
+  "extra": {}
+}

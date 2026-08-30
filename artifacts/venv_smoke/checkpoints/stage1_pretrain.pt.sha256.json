@@ -1,0 +1,23 @@
+{
+  "path": "artifacts\\venv_smoke\\checkpoints\\stage1_pretrain.pt",
+  "sha256": "8b045232fb24f4de108eb3db5bd9e7f89fc3dccb2712acc844774e0af9b50c47",
+  "metadata": {
+    "checkpoint_id": "stage1_pretrain",
+    "training_stage": "P1_PRETRAIN",
+    "global_step": 1,
+    "policy_version": 0,
+    "config": {
+      "steps": 1,
+      "batch_size": 2,
+      "n_cards": 3,
+      "lr": 0.0003,
+      "world_size": 1
+    },
+    "metrics": {
+      "loss_q_last": 0.14550478756427765
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788088875.5245047
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "path": "artifacts\\venv_smoke_fuller_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+  "sha256": "ccb2d5e3590812dfea4d3bf6aa7dd5d5f0ac7da32d28574f1432d2bd76337ca9",
+  "metadata": {
+    "checkpoint_id": "stage4_robust_rl",
+    "training_stage": "P4_ROBUST_RL",
+    "global_step": 1,
+    "policy_version": 2,
+    "config": {
+      "steps": 1,
+      "batch_size": 2,
+      "n_cards": 3,
+      "lr": 0.0001,
+      "world_size": 1
+    },
+    "metrics": {
+      "q_loss_last": 0.08127725124359131,
+      "actor_loss_last": -0.000274536432698369,
+      "policy_gradient_loss_last": -0.06605264544487,
+      "entropy_last": 0.5970086455345154,
+      "selfplay_trajectories": 2.0,
+      "selfplay_transitions": 6.0,
+      "replay_samples": 2.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788107715.6259682
+  }
+}

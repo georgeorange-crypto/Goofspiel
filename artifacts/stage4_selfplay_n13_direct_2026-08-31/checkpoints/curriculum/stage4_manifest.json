@@ -1,0 +1,13 @@
+{
+  "target_n": 13,
+  "warmup_n": 13,
+  "ramp_every": 1,
+  "probes": [
+    {
+      "step": 0,
+      "n_cards": 13,
+      "horizon": 13,
+      "reason": "target_n_reached"
+    }
+  ]
+}

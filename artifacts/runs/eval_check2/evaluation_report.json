@@ -1,0 +1,58 @@
+{
+  "reports": [
+    {
+      "name": "bot_matchup",
+      "metrics": {
+        "games": 16.0,
+        "mean_score_diff": 27.1875,
+        "win_rate": 0.9375,
+        "draw_rate": 0.0
+      },
+      "details": {
+        "bot_a": "heuristic",
+        "bot_b": "random",
+        "n_cards": 13
+      },
+      "passed": true
+    },
+    {
+      "name": "exact_feasibility_sweep",
+      "metrics": {
+        "max_n": 13.0
+      },
+      "details": {
+        "risk_by_n": {
+          "1": "GREEN",
+          "2": "GREEN",
+          "3": "GREEN",
+          "4": "GREEN",
+          "5": "GREEN",
+          "6": "GREEN",
+          "7": "YELLOW",
+          "8": "YELLOW",
+          "9": "ORANGE",
+          "10": "ORANGE",
+          "11": "ORANGE",
+          "12": "RED",
+          "13": "RED"
+        },
+        "states_by_n": {
+          "1": 2,
+          "2": 10,
+          "3": 56,
+          "4": 346,
+          "5": 2252,
+          "6": 15184,
+          "7": 104960,
+          "8": 739162,
+          "9": 5280932,
+          "10": 38165260,
+          "11": 278415920,
+          "12": 2046924400,
+          "13": 15148345760
+        }
+      },
+      "passed": true
+    }
+  ]
+}

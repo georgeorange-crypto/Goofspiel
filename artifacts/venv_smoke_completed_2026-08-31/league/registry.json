@@ -1,0 +1,37 @@
+{
+  "agents": [
+    {
+      "agent_id": "seed_initial_aggressive",
+      "role": "AGGRESSIVE",
+      "checkpoint_path": null,
+      "policy_version": 0,
+      "metrics": {
+        "priority": 1.0
+      },
+      "frozen": true,
+      "created_at": 1788109962.0081353
+    },
+    {
+      "agent_id": "seed_initial_exploiter",
+      "role": "EXPLOITER",
+      "checkpoint_path": null,
+      "policy_version": 0,
+      "metrics": {
+        "priority": 1.0
+      },
+      "frozen": true,
+      "created_at": 1788109962.0081353
+    },
+    {
+      "agent_id": "seed_initial_robust",
+      "role": "ROBUST",
+      "checkpoint_path": null,
+      "policy_version": 0,
+      "metrics": {
+        "priority": 1.0
+      },
+      "frozen": true,
+      "created_at": 1788109962.0081353
+    }
+  ]
+}

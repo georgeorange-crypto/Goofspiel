@@ -1,0 +1,11 @@
+# Install PyTorch separately for the server CUDA stack, then install this file.
+# Example for CUDA 12.4 wheels:
+#   python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
+
+-r requirements.txt
+gymnasium>=0.29
+tensorboard>=2.14
+wandb>=0.16
+pyyaml>=6.0
+httpx>=0.27
+pytest>=7.4

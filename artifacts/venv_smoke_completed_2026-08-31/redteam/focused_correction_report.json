@@ -1,0 +1,14 @@
+{
+  "training_plan": {
+    "method": "focused_correction_sft",
+    "steps": 3,
+    "source": "artifacts\\venv_smoke_completed_2026-08-31\\redteam\\corrections.jsonl",
+    "freeze_public_encoder": false,
+    "retain_general_replay_fraction": 0.25
+  },
+  "regression": {
+    "original_attack_regression_passed": true,
+    "general_regression_passed": true,
+    "recurrence": 0.0
+  }
+}

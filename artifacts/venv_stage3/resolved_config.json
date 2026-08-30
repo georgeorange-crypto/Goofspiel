@@ -1,0 +1,12 @@
+{
+  "artifact_dir": "artifacts\\venv_stage3",
+  "seed": 1,
+  "stage": "stage3_sft",
+  "steps": 1,
+  "batch_size": 2,
+  "device": "cuda",
+  "num_corpus_games": 32,
+  "n_cards": 3,
+  "dry_run": false,
+  "extra": {}
+}

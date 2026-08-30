@@ -1,0 +1,1 @@
+{"created_at": 1788106720.83523, "event_type": "STAGE4_SELFPLAY_COLLECTED", "game_id": null, "model_version": null, "payload": {"mean_final_score_diff": 2.0, "trajectories": 2, "transitions": 6}, "run_id": "stage4_robust_rl", "session_id": null, "severity": "INFO", "state_hash": null, "step": 0, "trace_id": "03178d3a3461421d8935cca3250753f7"}

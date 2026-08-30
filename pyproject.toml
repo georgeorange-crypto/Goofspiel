@@ -1,0 +1,111 @@
+# pyproject.toml for Goofspiel
+# Author: 陈子聪 (Chen Zicong)
+# Date:   2026-08-30
+#
+# Build pipeline:
+#   - C++ extension goofspiel._core is produced by CMakeLists.txt in cxxgoof/
+#     and dropped next to goofspiel/__init__.py.
+#   - cmake-build-extension handles CMake transparently during "pip install -e .".
+#   - Users who haven't installed CMake / a C++ compiler will still get the
+#     pure-Python goofspiel package (which retains ALL functionality except
+#     speed).  goofspiel/_cxx.py prints exactly 1 clear warning when import
+#     of the compiled extension fails, telling the user how to build it.
+
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+    "cmake-build-extension>=0.6",
+    "pybind11>=2.10",
+    "cmake>=3.24",
+    "ninja; platform_system!='Windows' or python_version>='3.10'",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goofspiel"
+version = "0.2.0"
+description = "Goofspiel card game: FastAPI UI, exact Nash solver, C++-accelerated vectorised environment for PPO / DRL training."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "陈子聪 (Chen Zicong)" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["goofspiel", "game", "nash equilibrium", "reinforcement learning",
+            "self-play", "ppo", "mcts"]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "psutil>=5.9",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "jinja2>=3.1",
+    "pydantic>=2.6",
+    "starlette>=0.36",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.0",
+    "gymnasium>=0.29",
+    "tensorboard>=2.14",
+    "wandb>=0.16",
+    "tianshou>=0.5",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "httpx>=0.27",   # FastAPI TestClient dependency
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+goofspiel-server = "app:__main__"
+
+[project.urls]
+Homepage   = "https://github.com/your-org/Liberty/Poker"
+BugTracker = "https://github.com/your-org/Liberty/Poker/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["goofspiel*"]
+
+[tool.cmake_build_extension]
+cmake_source_dir        = "cxxgoof"
+cmake_install_dir       = "."
+cmake_build_type        = "Release"
+# Always build the extension next to goofspiel/ so import goofspiel._core works.
+cmake_component         = "Unspecified"
+cmake_generator         = ""
+cmake_with_sdist        = false
+# Allows users to build without C++ compiler and still get the Python package.
+fail_on_build_error     = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (exclude from default runs with -m 'not slow')",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length    = 100
+lint.select    = ["E","F","W","I","N","UP","B","SIM","RUF"]
+lint.ignore    = ["E501"]

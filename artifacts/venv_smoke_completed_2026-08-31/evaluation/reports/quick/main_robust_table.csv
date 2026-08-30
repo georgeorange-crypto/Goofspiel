@@ -1,0 +1,8 @@
+arena,matrix_matching_pennies_gap,mean_score_diff,num_seeds,passed,worst_seed_score_diff
+E0_MATHEMATICAL_CORRECTNESS,0.0,,,True,
+E1_EXACT_SMALL_N,,,,,
+E2_N13_ROBUST,,10.666666666666666,3.0,,5.0
+E3_OPPONENT_MODELING,,,,,
+E4_ADAPTIVE_SAFETY,,,,,
+E5_SEARCH_COMPUTE,,,,,
+E6_GENERALIZATION,,,,,

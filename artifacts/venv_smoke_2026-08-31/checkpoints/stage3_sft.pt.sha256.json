@@ -1,0 +1,23 @@
+{
+  "path": "artifacts\\venv_smoke_2026-08-31\\checkpoints\\stage3_sft.pt",
+  "sha256": "8c9b14c867eb887fdae035a64abaac714de480e60f87ef892c8153dc71181cdb",
+  "metadata": {
+    "checkpoint_id": "stage3_sft",
+    "training_stage": "P3_STRATEGIC_SFT",
+    "global_step": 1,
+    "policy_version": 1,
+    "config": {
+      "steps": 1,
+      "batch_size": 2,
+      "n_cards": 3,
+      "lr": 0.0002,
+      "world_size": 1
+    },
+    "metrics": {
+      "loss_last": 0.240463525056839
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788105999.1863306
+  }
+}

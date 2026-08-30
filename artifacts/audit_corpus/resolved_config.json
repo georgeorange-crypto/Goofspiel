@@ -1,0 +1,12 @@
+{
+  "artifact_dir": "artifacts/audit_corpus",
+  "seed": 1,
+  "stage": "build_corpus",
+  "steps": 10,
+  "batch_size": 8,
+  "device": "cpu",
+  "num_corpus_games": 3,
+  "n_cards": 5,
+  "dry_run": false,
+  "extra": {}
+}

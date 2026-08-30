@@ -1,0 +1,122 @@
+{
+  "ok": true,
+  "device": "cuda",
+  "n_cards": 3,
+  "steps": 1,
+  "batch_size": 2,
+  "num_corpus_games": 2,
+  "event_log": "artifacts\\venv_smoke\\events\\training_smoke.jsonl",
+  "event_count": 10,
+  "stage0": {
+    "ok": true,
+    "checks": {
+      "environment_contract": true,
+      "pure_transition_contract": true,
+      "exact_complexity_estimator": true,
+      "reference_matrix_solver": true,
+      "jsonl_schema_store": true,
+      "teacher_priority_contract": true
+    },
+    "errors": []
+  },
+  "build_corpus": {
+    "games": 2,
+    "samples": 8
+  },
+  "stage1_pretrain": {
+    "stage": "P1_PRETRAIN",
+    "steps": 1,
+    "metrics": {
+      "loss_q_last": 0.14550478756427765
+    },
+    "checkpoint": "artifacts\\venv_smoke\\checkpoints\\stage1_pretrain.pt"
+  },
+  "stage2_semi_supervised": {
+    "stage": "P2_SEMI_SUPERVISED",
+    "steps": 1,
+    "metrics": {
+      "teacher_samples": 1.0,
+      "pseudo_accept_rate": 1.0
+    },
+    "checkpoint": null
+  },
+  "stage3_sft": {
+    "stage": "P3_STRATEGIC_SFT",
+    "steps": 1,
+    "metrics": {
+      "loss_last": 0.2500828504562378
+    },
+    "checkpoint": "artifacts\\venv_smoke\\checkpoints\\stage3_sft.pt"
+  },
+  "stage4_robust_rl": {
+    "stage": "P4_ROBUST_RL",
+    "steps": 1,
+    "metrics": {
+      "q_loss_last": 0.1577252298593521,
+      "actor_loss_last": -0.0002279294130858034
+    },
+    "checkpoint": "artifacts\\venv_smoke\\checkpoints\\stage4_robust_rl.pt"
+  },
+  "evaluation": {
+    "reports": [
+      {
+        "name": "bot_matchup",
+        "metrics": {
+          "games": 2.0,
+          "mean_score_diff": 12.0,
+          "win_rate": 0.5,
+          "draw_rate": 0.0
+        },
+        "details": {
+          "bot_a": "heuristic",
+          "bot_b": "random",
+          "n_cards": 13
+        },
+        "passed": true
+      },
+      {
+        "name": "exact_feasibility_sweep",
+        "metrics": {
+          "max_n": 13.0
+        },
+        "details": {
+          "risk_by_n": {
+            "1": "GREEN",
+            "2": "GREEN",
+            "3": "GREEN",
+            "4": "GREEN",
+            "5": "GREEN",
+            "6": "GREEN",
+            "7": "YELLOW",
+            "8": "YELLOW",
+            "9": "ORANGE",
+            "10": "ORANGE",
+            "11": "ORANGE",
+            "12": "RED",
+            "13": "RED"
+          },
+          "states_by_n": {
+            "1": 2,
+            "2": 10,
+            "3": 56,
+            "4": 346,
+            "5": 2252,
+            "6": 15184,
+            "7": 104960,
+            "8": 739162,
+            "9": 5280932,
+            "10": 38165260,
+            "11": 278415920,
+            "12": 2046924400,
+            "13": 15148345760
+          }
+        },
+        "passed": true
+      }
+    ],
+    "benchmark_report": {
+      "summary_json": "artifacts\\venv_smoke\\evaluation\\reports\\quick\\summary.json",
+      "summary_md": "artifacts\\venv_smoke\\evaluation\\reports\\quick\\summary.md"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "path": "artifacts\\stage4_selfplay_n13_direct_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+  "sha256": "6bc35763e4efcdb272de5453f93b6ff037813d4495a4c1f862a9034fd7f5fe76",
+  "metadata": {
+    "checkpoint_id": "stage4_robust_rl",
+    "training_stage": "P4_ROBUST_RL",
+    "global_step": 1,
+    "policy_version": 2,
+    "config": {
+      "steps": 1,
+      "batch_size": 1,
+      "n_cards": 13,
+      "lr": 0.0001,
+      "world_size": 1
+    },
+    "metrics": {
+      "q_loss_last": 0.1168208196759224,
+      "actor_loss_last": -8.578906999900937e-05,
+      "policy_gradient_loss_last": 0.3780499994754791,
+      "entropy_last": 1.734726071357727,
+      "selfplay_trajectories": 1.0,
+      "selfplay_transitions": 13.0,
+      "replay_samples": 1.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 13.0
+    },
+    "git_commit": null,
+    "python_version": "3.10.11",
+    "created_at": 1788107901.3854077
+  }
+}

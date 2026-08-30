@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <!--
+        Author: 陈子聪 (Chen Zicong)
+        Date: 2026-08-30
+        Purpose: Goofspiel UI with configurable N (1..13 cards) and
+                 AI opponent choice (Random / Heuristic / Exact Nash).
+                 Pure HTML + Vanilla JS + CSS. No framework.
+    -->
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Goofspiel — 人机对战 · 可选牌数 & AI</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>Goofspiel</h1>
+            <p class="subtitle" id="subtitle">准备中…</p>
+            <button id="btn-restart" type="button">重新开局 / New Game</button>
+        </header>
+
+        <!-- ============================================================ -->
+        <!-- Game-config panel (AI + deck size) — shown before first play -->
+        <!-- ============================================================ -->
+        <section id="config-panel" class="panel setup">
+            <h2>开局设置 · Game Setup</h2>
+            <form id="setup-form" autocomplete="off">
+                <div class="form-row">
+                    <label for="input-num-cards">牌数 N (1~13)：</label>
+                    <div class="field-with-hint">
+                        <input type="number" id="input-num-cards"
+                               min="1" max="13" value="13" step="1" required />
+                        <div class="hint" id="num-cards-hint">1 = 只有 A；13 = 完整一副 A~K</div>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <label for="input-bot">AI 对手：</label>
+                    <div class="field-with-hint">
+                        <select id="input-bot" required>
+                            <!-- options populated by app.js from /api/game/config -->
+                        </select>
+                        <div class="hint" id="bot-hint">
+                            Random：纯随机，练手用 · Heuristic：启发式，适合一般对局
+                            · Nash：数学最优，仅 N ≤ 7 可用
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ================ 开局三要素 · 三 · 可选机制开关 (VEIL §6/§9/§11) ================ -->
+                <div class="config-mechanisms">
+                    <div class="config-mechanisms-head">
+                        <h3>
+                            <span class="veil-badge">VEIL</span>
+                            可选规则机制 · Mechanisms
+                        </h3>
+                        <span class="muted small">
+                            （默认全关 = 经典 Goofspiel · 可任意叠加开启 · 勾多个组合玩不对称信息变体）
+                        </span>
+                    </div>
+                    <div id="veil-checkboxes" class="veil-options switches">
+                        <!-- toggle-switches populated by app.js from /api/game/config → veil_options -->
+                    </div>
+                    <div id="veil-nash-warn" class="hint warn hidden">
+                        ⚠️ 精确 Nash 与 VEIL 机制不兼容：如果选了 Nash 且勾了上面任一项，
+                        AI 会<b>诚实自动回落为 Heuristic</b>（Solver 推导假设不成立，不能输出"伪精确"分布）。
+                    </div>
+                </div>
+
+                <div id="fallback-warning" class="panel warn hidden"></div>
+
+                <div class="form-actions">
+                    <button id="btn-start" type="submit" class="primary">
+                        开始游戏
+                    </button>
+                    <span id="loading-hint" class="hint hidden">
+                        正在生成精确策略 (Nash N&gt;5 可能耗时数秒~数十秒) …
+                    </span>
+                </div>
+            </form>
+        </section>
+
+        <!-- Status bar: round / prize / carry pool / stake / scores -->
+        <section id="status-bar" class="panel">
+            <div class="status-item">
+                <div class="status-label">回合 Round</div>
+                <div class="status-value"><span id="round-num">–</span> / <span id="round-total">13</span></div>
+            </div>
+            <div class="status-item prize">
+                <div class="status-label">当前奖金 Current Prize</div>
+                <div class="status-value"><span id="current-prize">–</span></div>
+            </div>
+            <div class="status-item carry">
+                <div class="status-label">累计奖池 Carry Pool</div>
+                <div class="status-value"><span id="carry-pool">0</span></div>
+            </div>
+            <div class="status-item stake">
+                <div class="status-label">赢即拿 Total at Stake</div>
+                <div class="status-value"><span id="stake-total">–</span></div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">你的得分 Your Score</div>
+                <div class="status-value score-human" id="score-human">0</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">AI 得分 Bot Score</div>
+                <div class="status-value score-bot" id="score-bot">0</div>
+            </div>
+        </section>
+
+        <!-- ====== VEIL 状态栏 (隐藏/显示由 JS 控制, 开启任一机制时显示) ====== -->
+        <section id="veil-status" class="panel veil hidden">
+            <div class="veil-status-head">
+                <span class="veil-badge">VEIL 规则激活</span>
+                <span id="veil-active-tags"></span>
+            </div>
+            <div id="veil-status-body" class="veil-status-body">
+                <!-- JS 动态填充: 本回合你的花色、私人情报HIGH/LOW、对手情报归属提示 -->
+            </div>
+        </section>
+
+        <!-- Round result banner -->
+        <section id="round-banner" class="panel hidden">
+            <div id="round-banner-text"></div>
+        </section>
+
+        <!-- Game-over banner -->
+        <section id="final-banner" class="panel final hidden">
+            <div id="final-banner-text"></div>
+        </section>
+
+        <!-- Bot hand (remaining, face-down-ish symbols) -->
+        <section class="panel">
+            <h2>AI 剩余手牌 Bot Remaining Cards</h2>
+            <div id="bot-cards" class="cards"></div>
+        </section>
+
+        <!-- Human hand (clickable) -->
+        <section class="panel">
+            <h2>你的手牌 Your Remaining Cards
+                <span class="hint">(click one to play · 点一张出牌)</span>
+            </h2>
+            <div id="human-cards" class="cards human"></div>
+        </section>
+
+        <!-- AI Thinking panel (policy distribution bars) — placed below your hand so
+             you can see the cards AND the AI's projected distribution in one glance,
+             without scrolling back to the top after each click. -->
+        <section id="ai-thinking" class="panel ai hidden">
+            <h2>AI 决策分布 · <span id="ai-thinking-bot-type">—</span></h2>
+            <div id="ai-thinking-note" class="hint mb8"></div>
+            <div id="ai-value-line" class="ai-value">
+                当前状态价值 V (AI 期望 - 你期望)：<span id="ai-value">—</span>
+            </div>
+            <div id="ai-bars" class="bars"></div>
+        </section>
+
+        <!-- Human counterfactual "what if" analysis panel — placed right below your
+             hand AND right after the AI-distribution panel.  After you click a card
+             you can immediately see, for every OTHER card you could have played,
+             whether it would have won/tied/lost — with the actual played card
+             highlighted by a dashed outline.  Zero scroll. -->
+        <section id="human-counterfactual" class="panel human hidden">
+            <h2>你这步的反事实 · 每张牌改出会怎样 ·
+                <span class="hint">(固定 AI 这步实际出的牌)</span>
+            </h2>
+            <div id="human-cf-note" class="hint mb8"></div>
+            <div id="human-cf-bars" class="bars"></div>
+            <div class="legend-row">
+                <span class="dot dot-win"></span> Win (+stake · 拿全额奖池)
+                <span class="dot dot-tie"></span> Tie (平局 · 非末轮滚入下一轮 / 末轮丢弃)
+                <span class="dot dot-lose"></span> Lose (bot gets full stake)
+                <span class="played-marker">■ played 你实际打出</span>
+                <span class="bot-eff-chip bot-eff-profitable" style="margin-left:8px">Bot赚牌</span> 对手用小牌抢大奖，很划算
+                <span class="bot-eff-chip bot-eff-even">Bot平本</span> 对手出牌值 = 收益
+                <span class="bot-eff-chip bot-eff-wasted">Bot亏牌</span> 你逼对手打出大牌子力净亏（后面大奖对手少了强牌）
+            </div>
+        </section>
+
+        <!-- History -->
+        <section class="panel">
+            <h2>已用牌 Used Cards</h2>
+            <div class="used-wrap">
+                <div>
+                    <h4>你出过 You played</h4>
+                    <div id="human-used" class="cards used"></div>
+                </div>
+                <div>
+                    <h4>AI 出过 Bot played</h4>
+                    <div id="bot-used" class="cards used"></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>回合历史 Round History</h2>
+            <ol id="history-list" class="history"></ol>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+learning:
+  utility:
+    type: normalized_score_difference
+    gamma: 1.0
+  robust_q:
+    algorithm: full_matrix_nash_bellman
+    huber_delta: 0.1
+    target_tau: 0.005
+    chance_exact_threshold: 5
+    chance_samples: 4
+  matrix_solver:
+    algorithm: regret_matching_plus
+    iterations: 64
+    high_precision_iterations: 256
+    max_duality_gap: 0.01
+  robust_actor:
+    algorithm: neurd
+    neurd_weight: 1.0
+    nash_anchor_weight: 0.10
+    entropy_bonus: 0.0
+    detach_backbone: true
+  ensemble:
+    heads: 4
+    bootstrap_probability: 0.8
+  outcome:
+    bins: 201
+    range: [-1.0, 1.0]
+    mc_weight: 1.0
+    td_lambda:
+      enabled: true
+      lambda: 0.90
+      weight: 0.25
+    off_policy:
+      algorithm: joint_vtrace
+      rho_clip: 1.0
+      c_clip: 1.0
+  opponent:
+    fused_weight: 1.0
+    lstm_aux_weight: 0.3
+    mamba_aux_weight: 0.3
+    style:
+      enabled: true
+      projection_dim: 128
+      temperature: 0.10
+      weight: 0.10
+    switch:
+      enabled: true
+      positive_weight: 3.0
+      weight: 0.10
+    target_tau: 0.01
+  adaptive:
+    algorithm: opponent_conditioned_soft_best_response
+    br_temperature: 0.05
+    q_weight: 1.0
+    policy_weight: 0.25
+    distribution_weight: 0.5
+    residual_weight: 0.10
+    uncertainty_temperature: 0.10
+  symmetry:
+    q_weight: 0.10
+    distribution_weight: 0.05

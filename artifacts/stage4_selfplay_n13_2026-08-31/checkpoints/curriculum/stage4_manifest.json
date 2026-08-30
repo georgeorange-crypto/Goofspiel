@@ -1,0 +1,13 @@
+{
+  "target_n": 13,
+  "warmup_n": 3,
+  "ramp_every": 1,
+  "probes": [
+    {
+      "step": 0,
+      "n_cards": 3,
+      "horizon": 3,
+      "reason": "progressive_n_card_ramp"
+    }
+  ]
+}

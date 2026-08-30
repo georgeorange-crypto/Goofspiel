@@ -1,0 +1,96 @@
+{
+  "counts_by_role": {
+    "ROBUST": 1,
+    "AGGRESSIVE": 1,
+    "EXPLOITER": 1
+  },
+  "pfsp_weights": {
+    "bootstrap_aggressive": 1.0,
+    "bootstrap_exploiter": 1.0,
+    "bootstrap_robust": 1.0
+  },
+  "cross_play": [
+    {
+      "row_agent": "bootstrap_aggressive",
+      "col_agent": "bootstrap_aggressive",
+      "row_role": "AGGRESSIVE",
+      "col_role": "AGGRESSIVE",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_aggressive",
+      "col_agent": "bootstrap_exploiter",
+      "row_role": "AGGRESSIVE",
+      "col_role": "EXPLOITER",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_aggressive",
+      "col_agent": "bootstrap_robust",
+      "row_role": "AGGRESSIVE",
+      "col_role": "ROBUST",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_exploiter",
+      "col_agent": "bootstrap_aggressive",
+      "row_role": "EXPLOITER",
+      "col_role": "AGGRESSIVE",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_exploiter",
+      "col_agent": "bootstrap_exploiter",
+      "row_role": "EXPLOITER",
+      "col_role": "EXPLOITER",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_exploiter",
+      "col_agent": "bootstrap_robust",
+      "row_role": "EXPLOITER",
+      "col_role": "ROBUST",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_robust",
+      "col_agent": "bootstrap_aggressive",
+      "row_role": "ROBUST",
+      "col_role": "AGGRESSIVE",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_robust",
+      "col_agent": "bootstrap_exploiter",
+      "row_role": "ROBUST",
+      "col_role": "EXPLOITER",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    },
+    {
+      "row_agent": "bootstrap_robust",
+      "col_agent": "bootstrap_robust",
+      "row_role": "ROBUST",
+      "col_role": "ROBUST",
+      "mean_score_diff": 0.0,
+      "games": 0,
+      "source": "bootstrap_crossplay_prior"
+    }
+  ],
+  "historical_agents_frozen": true
+}

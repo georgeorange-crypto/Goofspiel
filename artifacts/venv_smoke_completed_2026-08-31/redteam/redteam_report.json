@@ -1,0 +1,24 @@
+{
+  "attacks": [
+    {
+      "failure_id": "redteam_attack_0_0c1158adf3384d67aa70a3960b0c9172",
+      "state_hash": "f2ccaf9997f8b12649625c664951d814b863a10d4b1138f4c3ea48a734d5c09a",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    },
+    {
+      "failure_id": "redteam_attack_1_7996f1fd58e44c719e2527e79ca3b9c7",
+      "state_hash": "7b28559ce76d170b20ffee2934155504567a9c9ac98097fda137241f83aef2e2",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    },
+    {
+      "failure_id": "redteam_attack_2_a92bbe33ba684a2aa9945c7f41d1f0e7",
+      "state_hash": "25f05d45cd2528eb3d3cfd42d07259f3ca5c598fae8423f07b3fc132ba94fc1f",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    }
+  ],
+  "corrections": 3,
+  "focused_correction": "artifacts\\venv_smoke_completed_2026-08-31\\redteam\\focused_correction_report.json"
+}

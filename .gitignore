@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+cxxbuild/
+goofspiel.egg-info/
+powershell.bat
+*.pyd
+*.so
+*.dll
+.vscode/
+.idea/
+*.log
+*.pt
+

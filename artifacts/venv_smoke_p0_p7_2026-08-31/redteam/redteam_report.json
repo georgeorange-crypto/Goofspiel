@@ -1,0 +1,23 @@
+{
+  "attacks": [
+    {
+      "failure_id": "redteam_attack_0_749a454ad953445ca093b79529b13b0e",
+      "state_hash": "f2ccaf9997f8b12649625c664951d814b863a10d4b1138f4c3ea48a734d5c09a",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    },
+    {
+      "failure_id": "redteam_attack_1_6606d012892449c0b0c12fa8662e9068",
+      "state_hash": "7b28559ce76d170b20ffee2934155504567a9c9ac98097fda137241f83aef2e2",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    },
+    {
+      "failure_id": "redteam_attack_2_f7a5e68dd00943b4ba0b630d64c4f20c",
+      "state_hash": "25f05d45cd2528eb3d3cfd42d07259f3ca5c598fae8423f07b3fc132ba94fc1f",
+      "teacher_source": "EXACT",
+      "teacher_confidence": 1.0
+    }
+  ],
+  "corrections": 3
+}

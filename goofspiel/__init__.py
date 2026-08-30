@@ -1,0 +1,115 @@
+"""
+Author: 陈子聪 (Chen Zicong)
+Date: 2026-08-30
+Purpose: Package entry point for the Goofspiel game library.
+         Exports the core classes so users can do:
+             from goofspiel import GoofspielEnv, RandomBot
+"""
+
+from .env import (
+    GoofspielEnv,
+    PlayerId,
+    Action,
+    Rng,
+    PLAYER_0,
+    PLAYER_1,
+    PLAYERS,
+    INFO_MODES,
+    INFO_LOW,
+    INFO_HIGH,
+    TIE_RULE_ROLLOVER,
+    TIE_RULE_DISCARD,
+    TIE_RULE_SPLIT,
+    TIE_RULES,
+    DEFAULT_TIE_RULE,
+)
+from .bots import (
+    RandomBot,
+    HeuristicBot,
+    NashBot,
+    create_bot,
+    BOT_RANDOM,
+    BOT_HEURISTIC,
+    BOT_NASH,
+    BOT_NASH_CARRY,
+    EXACT_MODE_CLASSIC,
+    EXACT_MODE_CARRY,
+    NASH_MAX_N,
+    NASH_CARRY_MAX_N,
+    BOT_TYPES,
+    BOT_DESCRIPTIONS,
+)
+from .solver import (
+    GoofspielExactSolver,
+    GoofspielCarrySolver,
+    SolverConfig,
+    SolveResult,
+    ComplexityReport,
+    estimate,
+    solve,
+    solve_with_policy,
+    estimate_carry,
+    solve_carry,
+    solve_with_policy_carry,
+    estimate_carry_complexity,
+    RISK_GREEN,
+    RISK_YELLOW,
+    RISK_ORANGE,
+    RISK_RED,
+    RISK_BLACK,
+    cards_to_mask,
+    mask_to_cards,
+    solve_zero_sum_matrix,
+)
+from .game import GameState, transition
+
+__all__ = [
+    "GoofspielEnv",
+    "RandomBot",
+    "HeuristicBot",
+    "PlayerId",
+    "Action",
+    "PLAYER_0",
+    "PLAYER_1",
+    "PLAYERS",
+    "GameState",
+    "transition",
+    # Enums / option sets
+    "INFO_MODES", "INFO_LOW", "INFO_HIGH",
+    "TIE_RULE_ROLLOVER", "TIE_RULE_DISCARD", "TIE_RULE_SPLIT",
+    "TIE_RULES", "DEFAULT_TIE_RULE",
+    # Exact Nash solvers
+    "GoofspielExactSolver",
+    "GoofspielCarrySolver",
+    "SolverConfig",
+    "SolveResult",
+    "ComplexityReport",
+    "estimate",
+    "solve",
+    "solve_with_policy",
+    "estimate_carry",
+    "solve_carry",
+    "solve_with_policy_carry",
+    "estimate_carry_complexity",
+    "RISK_GREEN",
+    "RISK_YELLOW",
+    "RISK_ORANGE",
+    "RISK_RED",
+    "RISK_BLACK",
+    # helpers
+    "cards_to_mask",
+    "mask_to_cards",
+    "solve_zero_sum_matrix",
+    # bot ids / limits
+    "BOT_RANDOM",
+    "BOT_HEURISTIC",
+    "BOT_NASH",
+    "BOT_NASH_CARRY",
+    "EXACT_MODE_CLASSIC",
+    "EXACT_MODE_CARRY",
+    "NASH_MAX_N",
+    "NASH_CARRY_MAX_N",
+    "create_bot",
+    "BOT_TYPES",
+    "BOT_DESCRIPTIONS",
+]

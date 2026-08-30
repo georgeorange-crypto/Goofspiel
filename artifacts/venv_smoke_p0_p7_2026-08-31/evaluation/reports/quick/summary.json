@@ -1,0 +1,106 @@
+{
+  "benchmark_version": "goofspiel.benchmark.v1",
+  "schema_version": "goofspiel.training.v1",
+  "profile": {
+    "name": "QUICK",
+    "seeds": [
+      1,
+      2,
+      3
+    ],
+    "num_games": 2,
+    "include_e7": false
+  },
+  "arenas": {
+    "E0_MATHEMATICAL_CORRECTNESS": {
+      "matrix_matching_pennies_gap": 0.0,
+      "passed": true
+    },
+    "E1_EXACT_SMALL_N": {
+      "risk_by_n": {
+        "1": "GREEN",
+        "2": "GREEN",
+        "3": "GREEN",
+        "4": "GREEN",
+        "5": "GREEN"
+      },
+      "states_by_n": {
+        "1": 2,
+        "2": 10,
+        "3": 56,
+        "4": 346,
+        "5": 2252
+      }
+    },
+    "E2_N13_ROBUST": {
+      "mean_score_diff": 19.666666666666668,
+      "worst_seed_score_diff": 10.0,
+      "num_seeds": 3.0
+    },
+    "E3_OPPONENT_MODELING": {
+      "status": "requires_trained_opponent_model",
+      "metrics_declared": [
+        "nll",
+        "brier",
+        "ece",
+        "switch_delay"
+      ]
+    },
+    "E4_ADAPTIVE_SAFETY": {
+      "status": "requires_trained_adaptive_branch",
+      "metrics_declared": [
+        "adaptive_gain",
+        "oracle_gain",
+        "risk_increase"
+      ]
+    },
+    "E5_SEARCH_COMPUTE": {
+      "rows": [
+        {
+          "method": "SM_MCTS",
+          "simulations": 128,
+          "runtime_ms": 16.785599997092504,
+          "quality_score": 1.997638888657093,
+          "exact_leaf_hits": 0
+        },
+        {
+          "method": "SM_MCTS",
+          "simulations": 512,
+          "runtime_ms": 16.485100000863895,
+          "quality_score": 1.997638888657093,
+          "exact_leaf_hits": 0
+        },
+        {
+          "method": "GT_CFR",
+          "iterations": 256,
+          "runtime_ms": 61.867000003985595,
+          "quality_score": 2.9994097221642733
+        }
+      ]
+    },
+    "E6_GENERALIZATION": {
+      "n_values": [
+        3,
+        5,
+        9,
+        13
+      ],
+      "metrics_declared": [
+        "robust_score",
+        "exploitability",
+        "opp_nll"
+      ]
+    }
+  },
+  "hard_gates": {
+    "G0_integrity": true,
+    "G1_exact_regression": true,
+    "G2_exploitability": true,
+    "G3_historical": true,
+    "G4_regression_suite": true,
+    "G5_opponent_calibration_declared": true,
+    "G6_adaptive_safety_declared": true,
+    "G7_numerical_performance": true
+  },
+  "promotion_decision": "PROMOTE_CANDIDATE"
+}

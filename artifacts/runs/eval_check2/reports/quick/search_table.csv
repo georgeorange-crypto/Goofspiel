@@ -1,0 +1,2 @@
+exact_leaf_hits,fallback,legal_joint_actions,method,quality_score,runtime_ms,simulations
+0,torch_free_reference,25,MATRIX_NASH_REFERENCE,1.0,0.0,0

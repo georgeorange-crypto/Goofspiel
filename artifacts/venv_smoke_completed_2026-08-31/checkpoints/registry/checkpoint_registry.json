@@ -1,0 +1,107 @@
+{
+  "latest": {
+    "kind": "latest",
+    "source_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+    "registry_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\registry\\latest.pt",
+    "sha256": "31593b1ba99c9dc761a27692236880dfeefa9686ab0a0e3d623de55886857508",
+    "global_step": 3,
+    "metrics": {
+      "q_loss_last": 0.13576200604438782,
+      "actor_loss_last": -0.0012737063225358725,
+      "policy_gradient_loss_last": 0.1528157889842987,
+      "entropy_last": 0.5955085158348083,
+      "selfplay_trajectories": 6.0,
+      "selfplay_transitions": 18.0,
+      "replay_samples": 6.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0
+    }
+  },
+  "teacher_ema": {
+    "kind": "teacher_ema",
+    "source_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\stage3_sft.pt",
+    "registry_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\registry\\teacher_ema.pt",
+    "sha256": "e7cefc75d5cc4ea519d38da0ffe6fabcb3a1151a839840b52dd78825c5ac7fee",
+    "global_step": 3,
+    "metrics": {
+      "loss_last": 0.17320047318935394,
+      "exact_sft_samples": 6.0,
+      "search_cfr_sft_samples": 6.0,
+      "opponent_behaviour_sft_samples": 6.0,
+      "high_confidence_pseudo_sft_samples": 6.0,
+      "pretraining_anchors_retained": 1.0
+    }
+  },
+  "best_robust": {
+    "kind": "best_robust",
+    "source_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+    "registry_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\registry\\best_robust.pt",
+    "sha256": "31593b1ba99c9dc761a27692236880dfeefa9686ab0a0e3d623de55886857508",
+    "global_step": 3,
+    "metrics": {
+      "q_loss_last": 0.13576200604438782,
+      "actor_loss_last": -0.0012737063225358725,
+      "policy_gradient_loss_last": 0.1528157889842987,
+      "entropy_last": 0.5955085158348083,
+      "selfplay_trajectories": 6.0,
+      "selfplay_transitions": 18.0,
+      "replay_samples": 6.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0
+    }
+  },
+  "best_raw": {
+    "kind": "best_raw",
+    "source_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+    "registry_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\registry\\best_raw.pt",
+    "sha256": "31593b1ba99c9dc761a27692236880dfeefa9686ab0a0e3d623de55886857508",
+    "global_step": 3,
+    "metrics": {
+      "q_loss_last": 0.13576200604438782,
+      "actor_loss_last": -0.0012737063225358725,
+      "policy_gradient_loss_last": 0.1528157889842987,
+      "entropy_last": 0.5955085158348083,
+      "selfplay_trajectories": 6.0,
+      "selfplay_transitions": 18.0,
+      "replay_samples": 6.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0
+    }
+  },
+  "best_search": {
+    "kind": "best_search",
+    "source_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+    "registry_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\registry\\best_search.pt",
+    "sha256": "31593b1ba99c9dc761a27692236880dfeefa9686ab0a0e3d623de55886857508",
+    "global_step": 3,
+    "metrics": {
+      "q_loss_last": 0.13576200604438782,
+      "actor_loss_last": -0.0012737063225358725,
+      "policy_gradient_loss_last": 0.1528157889842987,
+      "entropy_last": 0.5955085158348083,
+      "selfplay_trajectories": 6.0,
+      "selfplay_transitions": 18.0,
+      "replay_samples": 6.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0
+    }
+  },
+  "best_generalization": {
+    "kind": "best_generalization",
+    "source_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\stage4_robust_rl.pt",
+    "registry_path": "artifacts\\venv_smoke_completed_2026-08-31\\checkpoints\\registry\\best_generalization.pt",
+    "sha256": "31593b1ba99c9dc761a27692236880dfeefa9686ab0a0e3d623de55886857508",
+    "global_step": 3,
+    "metrics": {
+      "q_loss_last": 0.13576200604438782,
+      "actor_loss_last": -0.0012737063225358725,
+      "policy_gradient_loss_last": 0.1528157889842987,
+      "entropy_last": 0.5955085158348083,
+      "selfplay_trajectories": 6.0,
+      "selfplay_transitions": 18.0,
+      "replay_samples": 6.0,
+      "target_network_ema": 0.995,
+      "curriculum_final_n": 3.0
+    }
+  }
+}

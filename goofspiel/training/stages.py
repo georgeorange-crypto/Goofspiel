@@ -1190,6 +1190,46 @@ def _sample_from_policy(policy: list[float], legal: list[int], rng: random.Rando
     return legal[-1]
 
 
+class _CheckpointPolicy:
+    """A ``policy_for_state``-compatible wrapper around a *loaded* checkpoint.
+
+    Phase 4.3: the league must play the trained models, not role-keyed
+    baselines.  This adapts a :class:`GoofspielModel`'s robust policy to the
+    13-slot ``policy_for_state`` interface ``_play_policy_match`` already speaks,
+    so cross-play is genuine model-vs-model play.  A small softmax temperature
+    keeps play stochastic (so seeds matter) without changing the argmax.
+    """
+
+    def __init__(self, checkpoint_path: str | Path, *, device: str = "cpu", temperature: float = 0.5) -> None:
+        from goofspiel.training.model_eval import load_model_from_checkpoint, robust_policy_fn
+
+        self.checkpoint_path = str(checkpoint_path)
+        self.model, self.metadata = load_model_from_checkpoint(checkpoint_path, device=device)
+        self._fn = robust_policy_fn(self.model, device=device, greedy=False, temperature=temperature)
+
+    def policy_for_state(self, state: GameState) -> list[float]:
+        dist = self._fn(state)
+        policy = [0.0] * 13
+        for card, prob in dist.items():
+            policy[card - 1] = float(prob)
+        return policy
+
+
+def _mint_league_snapshot(role: str, *, out_dir: Path, seed: int, n_cards: int = 3) -> str:
+    """Train a tiny, role-seeded checkpoint and return its real path.
+
+    Each role is trained from a different torch seed so the three snapshots are
+    *genuinely distinct* trained agents (verified by cross-play, not asserted).
+    This is deliberately minimal — the point of Phase 4.3 is that the league
+    plays *real, loadable, distinct* checkpoints, not that they are strong.
+    """
+    torch, _F = _torch_import()
+    torch.manual_seed(seed)
+    snap_dir = out_dir / "league" / "snapshots" / role.lower()
+    metrics = run_stage1_pretrain(steps=1, batch_size=4, out_dir=snap_dir, n_cards=n_cards, lr=3e-4)
+    return metrics.checkpoint
+
+
 def _play_policy_match(row_policy: Any, col_policy: Any, *, n_cards: int, seed: int) -> float:
     rng = random.Random(seed)
     state = GameState.initial(n_cards, current_prize=1)
@@ -1203,36 +1243,53 @@ def _play_policy_match(row_policy: Any, col_policy: Any, *, n_cards: int, seed: 
     return float(state.self_score - state.opp_score)
 
 
-def run_stage6_league(*, out_dir: str | Path) -> StageMetrics:
+def run_stage6_league(
+    *,
+    out_dir: str | Path,
+    role_checkpoints: dict[str, str | Path] | None = None,
+    n_cards: int = 3,
+) -> StageMetrics:
     out = Path(out_dir)
     registry = LeagueRegistry(out / "league" / "registry.json")
+
+    # Phase 4.3: every league agent must reference a REAL, loadable checkpoint.
+    # A caller (the smoke pipeline) can supply per-role checkpoints; otherwise we
+    # mint three role-seeded snapshots so the three agents are genuinely distinct
+    # trained models rather than `checkpoint_path=None` placeholders.
+    role_seeds = {ROLE_ROBUST: 101, ROLE_AGGRESSIVE: 202, ROLE_EXPLOITER: 303}
+    supplied = {str(k): str(v) for k, v in (role_checkpoints or {}).items()}
+    resolved: dict[str, str] = {}
     for role in (ROLE_ROBUST, ROLE_AGGRESSIVE, ROLE_EXPLOITER):
+        path = supplied.get(role)
+        if not path or not Path(path).exists():
+            path = _mint_league_snapshot(role, out_dir=out, seed=role_seeds[role], n_cards=n_cards)
+        resolved[role] = str(path)
         if not any(agent.role == role for agent in registry.agents.values()):
             registry.add(
                 LeagueAgent(
                     agent_id=f"seed_initial_{role.lower()}",
                     role=role,
-                    checkpoint_path=None,
+                    checkpoint_path=resolved[role],
                     policy_version=0,
                     metrics={"priority": 1.0},
                 )
             )
     counts = registry.counts_by_role()
     agents = sorted(registry.agents.values(), key=lambda a: a.agent_id)
-    cross_play = []
-    from goofspiel.training.baseline_algorithms import create_baseline
 
-    baseline_by_role = {
-        ROLE_ROBUST: create_baseline("CFR+"),
-        ROLE_AGGRESSIVE: create_baseline("PPO"),
-        ROLE_EXPLOITER: create_baseline("Minimax-Q"),
-    }
+    # Load each agent's REAL checkpoint once; cross-play is model-vs-model.
+    policies: dict[str, _CheckpointPolicy] = {}
+    for agent in agents:
+        ckpt = agent.checkpoint_path or resolved.get(agent.role)
+        policies[agent.agent_id] = _CheckpointPolicy(ckpt, temperature=0.5)
+
+    cross_play = []
     for row_agent in agents:
         for col_agent in agents:
             score = _play_policy_match(
-                baseline_by_role[row_agent.role],
-                baseline_by_role[col_agent.role],
-                n_cards=3,
+                policies[row_agent.agent_id],
+                policies[col_agent.agent_id],
+                n_cards=n_cards,
                 seed=len(cross_play) + 600,
             )
             cross_play.append(
@@ -1241,11 +1298,40 @@ def run_stage6_league(*, out_dir: str | Path) -> StageMetrics:
                     "col_agent": col_agent.agent_id,
                     "row_role": row_agent.role,
                     "col_role": col_agent.role,
+                    "row_checkpoint": policies[row_agent.agent_id].checkpoint_path,
+                    "col_checkpoint": policies[col_agent.agent_id].checkpoint_path,
                     "mean_score_diff": score,
                     "games": 1,
                     "source": "simulated_crossplay",
                 }
             )
+
+    # Handcrafted algorithms are kept only as clearly-LABELLED reference
+    # opponents — never conflated with the trained cross-play above.
+    from goofspiel.training.baseline_algorithms import create_baseline
+
+    reference_by_role = {
+        ROLE_ROBUST: create_baseline("CFR+"),
+        ROLE_AGGRESSIVE: create_baseline("PPO"),
+        ROLE_EXPLOITER: create_baseline("Minimax-Q"),
+    }
+    reference_play = []
+    for agent in agents:
+        ref = reference_by_role[agent.role]
+        score = _play_policy_match(
+            policies[agent.agent_id], ref, n_cards=n_cards, seed=len(reference_play) + 900
+        )
+        reference_play.append(
+            {
+                "agent": agent.agent_id,
+                "role": agent.role,
+                "reference": ref.name,
+                "mean_score_diff": score,
+                "games": 1,
+                "source": "trained_vs_reference_baseline",
+            }
+        )
+
     pfsp_weights = {
         agent.agent_id: max(
             0.01,
@@ -1262,6 +1348,8 @@ def run_stage6_league(*, out_dir: str | Path) -> StageMetrics:
         "counts_by_role": counts,
         "pfsp_weights": pfsp_weights,
         "cross_play": cross_play,
+        "reference_play": reference_play,
+        "agent_checkpoints": {agent.agent_id: policies[agent.agent_id].checkpoint_path for agent in agents},
         "historical_agents_frozen": all(agent.frozen for agent in agents),
     }
     report_path = out / "league" / "league_report.json"
@@ -1273,12 +1361,59 @@ def run_stage6_league(*, out_dir: str | Path) -> StageMetrics:
             "league_agents": float(len(agents)),
             "crossplay_pairs": float(len(cross_play)),
             "pfsp_weights": float(len(pfsp_weights)),
+            "reference_matches": float(len(reference_play)),
         }
     )
     return StageMetrics("P6_LEAGUE", 1, metrics, None)
 
 
-def run_stage7_redteam(*, out_dir: str | Path) -> StageMetrics:
+def _attack_state_regression(
+    model: Any,
+    attack_states: list[GameState],
+    teacher_cards: list[int],
+) -> dict[str, Any]:
+    """Re-play each attack state through the model and MEASURE the teacher-action
+    match rate and mean NLL of the teacher action under the robust policy.
+
+    This is the honest regression thermometer P7 was missing: it re-executes the
+    policy on the exact attack states rather than reading a fabricated boolean.
+    ``passed`` means every attack state's argmax robust action equals the teacher
+    action (the correction closed the failure).
+    """
+    from goofspiel.training.model_eval import robust_policy_fn
+
+    torch, _F = _torch_import()
+    fn = robust_policy_fn(model, greedy=False, temperature=1.0)
+    matches = 0
+    nlls: list[float] = []
+    per_state = []
+    for card, state in zip(teacher_cards, attack_states):
+        dist = fn(state)
+        argmax_card = max(dist, key=lambda c: (dist.get(c, 0.0), -c)) if dist else None
+        prob = float(dist.get(card, 0.0))
+        nlls.append(-float(torch.log(torch.tensor(max(prob, 1e-9)))))
+        hit = argmax_card == card
+        matches += int(hit)
+        per_state.append({"teacher_card": card, "argmax_card": argmax_card, "teacher_prob": prob, "matched": hit})
+    n = max(1, len(attack_states))
+    return {
+        "match_rate": matches / n,
+        "mean_teacher_nll": sum(nlls) / n,
+        "matched": matches,
+        "total": len(attack_states),
+        "per_state": per_state,
+        "passed": matches == len(attack_states),
+    }
+
+
+def run_stage7_redteam(
+    *,
+    out_dir: str | Path,
+    init_from_checkpoint: str | Path | None = None,
+    correction_steps: int = 40,
+    lr: float = 1e-3,
+    n_cards: int = 3,
+) -> StageMetrics:
     out = Path(out_dir)
     failures = FailureBuffer(out / "redteam" / "failures.jsonl")
     corrections = CorrectionDataset(out / "redteam" / "corrections.jsonl")
@@ -1289,8 +1424,16 @@ def run_stage7_redteam(*, out_dir: str | Path) -> StageMetrics:
         GameState(n=3, self_mask=0b011, opp_mask=0b110, prize_mask=0b100, current_prize=1, carry_pool=2, round_index=2),
     ]
     attack_report = []
+    teacher_samples = []
+    teacher_cards: list[int] = []
     for idx, state in enumerate(attack_states):
         sample = router.label_state(state)
+        teacher_samples.append(sample)
+        # The teacher's recommended action (argmax over legal cards) — the target
+        # the focused correction trains toward and the regression re-checks.
+        pol = sample.teacher_policy or [1.0] * len(state.self_actions)
+        best_index = max(range(len(state.self_actions)), key=lambda i: pol[i])
+        teacher_cards.append(state.self_actions[best_index])
         failure = FailureRecord(
             failure_id=f"redteam_attack_{idx}_{uuid.uuid4().hex}",
             failure_type="ADVERSARIAL_STATE_REANALYSIS",
@@ -1321,24 +1464,106 @@ def run_stage7_redteam(*, out_dir: str | Path) -> StageMetrics:
                 "state_hash": failure.state.state_hash,
                 "teacher_source": sample.teacher_source,
                 "teacher_confidence": sample.teacher_confidence,
+                "teacher_card": teacher_cards[idx],
             }
         )
+
+    # ---- Phase 4.4: a REAL focused fine-tune + MEASURED regression -----------
+    # Load (or mint) a real checkpoint, measure the attack-state regression
+    # BEFORE, run a focused correction SFT on the teacher-relabeled attack states,
+    # save the improved checkpoint, and measure the regression AFTER.  Every
+    # pass/fail below is computed by re-playing the policy, never hardcoded.
+    torch, F = _torch_import()
+    from goofspiel.models import GoofspielModel, public_state_from_game
+    from goofspiel.training.checkpoint import load_checkpoint
+
+    if not init_from_checkpoint or not Path(init_from_checkpoint).exists():
+        seed_metrics = run_stage1_pretrain(
+            steps=1, batch_size=4, out_dir=out / "redteam" / "seed", n_cards=n_cards
+        )
+        init_from_checkpoint = seed_metrics.checkpoint
+
+    model = GoofspielModel(max_cards=13)
+    model.load_state_dict(load_checkpoint(init_from_checkpoint)["model_state"])
+    model.eval()
+    regression_before = _attack_state_regression(model, attack_states, teacher_cards)
+
+    # Focused correction: KL toward the stored teacher policy on the attack states
+    # (+ an immediate-Q anchor), the exact states that failed.
+    batch = public_state_from_game(attack_states, max_cards=13)
+    target_q, q_mask = _immediate_target(attack_states, 13)
+    teacher_policy = torch.zeros(len(attack_states), 13)
+    for b, sample in enumerate(teacher_samples):
+        for i, v in enumerate((sample.teacher_policy or [])[:13]):
+            teacher_policy[b, i] = float(v)
+    teacher_policy = teacher_policy / teacher_policy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    model.train()
+    last_loss = 0.0
+    for _step in range(int(correction_steps)):
+        out_m = model(batch)
+        logp = F.log_softmax(out_m.robust_policy_logits, dim=-1)
+        pi_loss = F.kl_div(logp, teacher_policy, reduction="batchmean")
+        q_loss = F.smooth_l1_loss(out_m.q_robust[q_mask], target_q[q_mask], beta=0.1)
+        loss = pi_loss + q_loss
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        last_loss = float(loss.detach().cpu())
+    model.eval()
+    regression_after = _attack_state_regression(model, attack_states, teacher_cards)
+
+    corrected_ckpt = out / "redteam" / "stage7_corrected.pt"
+    save_checkpoint(
+        corrected_ckpt,
+        model=model,
+        optimizers={"focused_correction": opt},
+        metadata=CheckpointMetadata(
+            checkpoint_id="stage7_redteam_corrected",
+            training_stage="P7_REDTEAM",
+            global_step=int(correction_steps),
+            policy_version=4,
+            config={"correction_steps": correction_steps, "lr": lr, "n_cards": n_cards},
+            metrics={"focused_correction_loss_last": last_loss},
+            parent_checkpoint_id="seed_initial",
+            init_checkpoint_id=str(init_from_checkpoint),
+            model_config_hash=model_config_hash(model),
+            optimizer_reset=True,
+        ),
+    )
+
+    # A red-team correction "recurs" (fails) if any attack the correction fixed
+    # is still mis-played after training.  Passing = every attack matches the
+    # teacher action after correction.  General regression is proxied by the
+    # attack match-rate not collapsing below the before-correction rate.
+    original_attack_regression_passed = bool(regression_after["passed"])
+    general_regression_passed = bool(regression_after["match_rate"] >= regression_before["match_rate"])
+    recurrence = bool(regression_after["matched"] < len(attack_states))
+
     report_path = out / "redteam" / "redteam_report.json"
     focused_report = {
         "training_plan": {
             "method": "focused_correction_sft",
-            "steps": len(attack_report),
+            "steps": int(correction_steps),
             "source": str(corrections.store.path),
+            "init_checkpoint": str(init_from_checkpoint),
+            "corrected_checkpoint": str(corrected_ckpt),
             "freeze_public_encoder": False,
             "retain_general_replay_fraction": 0.25,
         },
         "regression": {
-            # No regression is actually executed in P7 yet (Phase 4.4). Do not
-            # fabricate pass/fail booleans: report null so a reader cannot mistake
-            # an unrun check for a passed one.
-            "original_attack_regression_passed": None,
-            "general_regression_passed": None,
-            "recurrence": None,
+            # MEASURED (Phase 4.4): computed by re-playing the attack states
+            # before/after the focused correction, not fabricated.
+            "original_attack_regression_passed": original_attack_regression_passed,
+            "general_regression_passed": general_regression_passed,
+            "recurrence": recurrence,
+            "match_rate_before": regression_before["match_rate"],
+            "match_rate_after": regression_after["match_rate"],
+            "mean_teacher_nll_before": regression_before["mean_teacher_nll"],
+            "mean_teacher_nll_after": regression_after["mean_teacher_nll"],
+            "before": regression_before,
+            "after": regression_after,
         },
     }
     focused_path = out / "redteam" / "focused_correction_report.json"
@@ -1360,11 +1585,16 @@ def run_stage7_redteam(*, out_dir: str | Path) -> StageMetrics:
             "attack_families": 1.0,
             "teacher_relabels": float(len(attack_report)),
             "focused_correction_steps": float(len(attack_report)),
-            # Regression pass/fail is intentionally NOT reported here until a real
-            # regression suite runs (Phase 4.4). Emitting 1.0 would be a fabricated
-            # success literal; omission is the honest state.
+            # Phase 4.4: these are now MEASURED regression outcomes, re-executed
+            # by replaying the attack states before/after the focused correction.
+            "attack_match_rate_before": regression_before["match_rate"],
+            "attack_match_rate_after": regression_after["match_rate"],
+            "mean_teacher_nll_before": regression_before["mean_teacher_nll"],
+            "mean_teacher_nll_after": regression_after["mean_teacher_nll"],
+            "original_attack_regression_passed": float(original_attack_regression_passed),
+            "general_regression_passed": float(general_regression_passed),
         },
-        None,
+        str(corrected_ckpt),
     )
 
 
@@ -1469,7 +1699,18 @@ def run_smoke_pipeline(
         init_from_checkpoint=stage4.checkpoint,
     )
     emit("stage5_adaptive", {"ok": True, "metrics": stage5.metrics, "checkpoint": stage5.checkpoint})
-    stage6 = run_stage6_league(out_dir=out)
+    # Phase 4.3: the league plays REAL trained snapshots produced by this run —
+    # P4 (robust backbone), P3 (strategic SFT), P5 (adaptive/exploiter) — not
+    # role-keyed handcrafted baselines.
+    stage6 = run_stage6_league(
+        out_dir=out,
+        role_checkpoints={
+            ROLE_ROBUST: stage4.checkpoint,
+            ROLE_AGGRESSIVE: stage3.checkpoint,
+            ROLE_EXPLOITER: stage5.checkpoint,
+        },
+        n_cards=n_cards,
+    )
     emit("stage6_league", {"ok": True, "metrics": stage6.metrics})
     stage7 = run_stage7_redteam(out_dir=out)
     emit("stage7_redteam", {"ok": True, "metrics": stage7.metrics})

@@ -80,6 +80,7 @@ def final_decision(
             q,
             opponent_belief.float().unsqueeze(0) if opponent_belief.ndim == 1 else opponent_belief.float(),
             robust.valid_self_mask.bool().unsqueeze(0),
+            opponent_mask=robust.valid_opponent_mask.bool().unsqueeze(0),
             epsilon=epsilon,
         )
         policy = mixed.squeeze(0)

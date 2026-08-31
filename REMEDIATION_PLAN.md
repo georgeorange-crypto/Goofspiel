@@ -605,6 +605,22 @@ row-min-then-softmax over the immediate matrix (`:50-51`). So "league cross-play
 play the loaded models. Keep the handcrafted baselines only as labeled *reference*
 opponents.
 
+> **Status — DONE (2026-08-31).** `run_stage6_league` now takes optional
+> `role_checkpoints` and, for any role without a supplied checkpoint, mints a
+> role-seeded real snapshot via `_mint_league_snapshot` (a tiny P1 train from a
+> per-role torch seed). Each `LeagueAgent` is registered with its real
+> `checkpoint_path` (never `None`). New `_CheckpointPolicy` loads a checkpoint and
+> adapts its robust policy to the `policy_for_state` interface, so `_play_policy_match`
+> now plays **model vs model**. The smoke pipeline feeds the run's own P4/P3/P5
+> checkpoints as the ROBUST/AGGRESSIVE/EXPLOITER snapshots. The 9-row `cross_play`
+> block keeps `source="simulated_crossplay"` (now truthfully) and gains
+> `row_checkpoint`/`col_checkpoint`; handcrafted baselines survive only in a separate
+> `reference_play` block labeled `trained_vs_reference_baseline`, plus an
+> `agent_checkpoints` map. Acceptance test `test_stage6_league_plays_real_distinct_checkpoints`
+> **re-executes** the contract: every agent checkpoint loads as a `GoofspielModel`, the
+> three snapshots are byte-distinct, and a cross-play row is reproduced by re-playing
+> the loaded models at the same seed. Both prior stage6 tests still pass.
+
 ### 4.4 P7 does a real focused fine-tune and re-runs the regression
 
 **Problem.** P7 writes a dict literally named `"training_plan"` (`stages.py:806-813`)

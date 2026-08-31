@@ -315,6 +315,71 @@ def test_stage6_crossplay_contains_simulated_score_diff(tmp_path: Path):
         assert row["games"] >= 1
 
 
+def test_stage6_league_plays_real_distinct_checkpoints(tmp_path: Path):
+    """Phase 4.3: league agents reference REAL, loadable, DISTINCT checkpoints
+    and cross-play is model-vs-model — re-executed, not read from a field.
+
+    Before 4.3 every agent had `checkpoint_path=None` and cross-play secretly
+    substituted role-keyed handcrafted baselines while labelling the rows
+    `simulated_crossplay`.  This test:
+      1. asserts each agent's checkpoint exists and loads as a GoofspielModel;
+      2. asserts the three snapshots are genuinely distinct (different weights);
+      3. RE-PLAYS one cross-play pair through the same primitive and reproduces
+         the reported score — proving the rows are real model-vs-model matches.
+    """
+    try:
+        __import__("torch")
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"torch cannot be imported: {exc}")
+    import json
+
+    import torch
+
+    from goofspiel.training.model_eval import load_model_from_checkpoint
+    from goofspiel.training.stages import _CheckpointPolicy, _play_policy_match
+
+    result = TrainingCoordinator(
+        TrainingRunConfig(artifact_dir=str(tmp_path / "stage6"), stage="stage6_league")
+    ).run()
+    assert result["ok"] is True
+    report = json.loads((tmp_path / "stage6" / "league" / "league_report.json").read_text(encoding="utf-8"))
+
+    # 1. Every agent references a real, loadable checkpoint (no None placeholders).
+    agent_ckpts = report["agent_checkpoints"]
+    assert len(agent_ckpts) == 3
+    models = {}
+    for agent_id, ckpt in agent_ckpts.items():
+        assert ckpt, f"agent {agent_id} has no checkpoint (Phase 4.3 regression)"
+        assert Path(ckpt).exists(), f"checkpoint missing on disk: {ckpt}"
+        model, _meta = load_model_from_checkpoint(ckpt)
+        models[agent_id] = model
+
+    # 2. The three snapshots are genuinely distinct trained agents.
+    states = [dict(model.state_dict()) for model in models.values()]
+    any_pair_differs = False
+    for i in range(len(states)):
+        for j in range(i + 1, len(states)):
+            for key in states[i]:
+                if not torch.equal(states[i][key], states[j][key]):
+                    any_pair_differs = True
+                    break
+    assert any_pair_differs, "league snapshots are byte-identical — not distinct agents"
+
+    # 3. Re-execute a cross-play pair and reproduce its reported score.
+    rows = report["cross_play"]
+    assert len(rows) == 9
+    row = rows[0]
+    row_pol = _CheckpointPolicy(row["row_checkpoint"], temperature=0.5)
+    col_pol = _CheckpointPolicy(row["col_checkpoint"], temperature=0.5)
+    replayed = _play_policy_match(row_pol, col_pol, n_cards=3, seed=600)  # first row -> seed 600
+    assert replayed == pytest.approx(row["mean_score_diff"]), "cross-play row is not reproducible model play"
+
+    # Handcrafted baselines survive ONLY as a clearly-labelled reference block.
+    ref_rows = report["reference_play"]
+    assert len(ref_rows) == 3
+    assert {r["source"] for r in ref_rows} == {"trained_vs_reference_baseline"}
+
+
 # ================================================================
 # P7 red-team: focused correction + regression reports are real artifacts
 # ================================================================

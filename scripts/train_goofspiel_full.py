@@ -9,6 +9,14 @@ Examples:
     python scripts/train_goofspiel_full.py --stage stage1_pretrain --steps 1000 --batch-size 64 --device cuda
     python scripts/train_goofspiel_full.py --stage stage3_sft --steps 1000 --batch-size 64 --device cuda
     python scripts/train_goofspiel_full.py --eval-checkpoint artifacts/runs/manual/checkpoints/stage4_robust_rl.pt
+
+    # Full auto-wired pipeline (θ inherited stage-to-stage automatically):
+    python scripts/train_goofspiel_full.py --stage all --steps 2000 --batch-size 64 --device cuda
+
+When run per-stage into a SHARED --artifact-dir, each θ-stage auto-discovers and
+inherits the previous stage's checkpoint from disk; with --stage all the whole
+chain is threaded in one process.  Pass --init-from-checkpoint to override the
+seed weights of the first/only stage explicitly.
 """
 
 from __future__ import annotations
@@ -51,6 +59,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-corpus-games", type=int, default=32)
     p.add_argument("--n-cards", type=int, default=5)
     p.add_argument("--dry-run", action="store_true")
+    # Stage transition (Phase 3.1): explicitly seed the first/only stage's θ from
+    # a checkpoint. In `--stage all` this seeds the chain head (stage1); for a
+    # single θ-stage it overrides the on-disk auto-discovery. Mutually exclusive
+    # with --resume-checkpoint.
+    p.add_argument("--init-from-checkpoint", default=None,
+                   help="Seed θ (weights only) from this checkpoint; overrides auto-discovery.")
+    p.add_argument("--resume-checkpoint", default=None,
+                   help="Crash resume: restore full training state (model+optimizer+step).")
     # Phase 0.1: honest evaluation of a trained checkpoint. When supplied, the
     # script evaluates the checkpoint and exits without running any stage.
     p.add_argument("--eval-checkpoint", default=None,
@@ -73,6 +89,8 @@ def config_from_args(args: argparse.Namespace) -> TrainingRunConfig:
         num_corpus_games=args.num_corpus_games,
         n_cards=args.n_cards,
         dry_run=args.dry_run,
+        init_from_checkpoint=args.init_from_checkpoint,
+        resume_checkpoint=args.resume_checkpoint,
     )
 
 

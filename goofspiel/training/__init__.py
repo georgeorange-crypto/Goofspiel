@@ -4,7 +4,13 @@ The package is importable without PyTorch.  Stage runners that actually train
 neural networks import torch lazily inside their functions.
 """
 
-from .coordinator import TrainingCoordinator, TrainingRunConfig
+from .coordinator import (
+    FULL_SEQUENCE_ALIASES,
+    THETA_PARENT,
+    THETA_PRODUCERS,
+    TrainingCoordinator,
+    TrainingRunConfig,
+)
 from .distributed import DistributedTrainingConfig, STAGE_SEQUENCE, torchrun_command
 from .checkpoint_registry import CHECKPOINT_KINDS, CheckpointRegistry
 from .data import (
@@ -22,6 +28,9 @@ from .data import (
 __all__ = [
     "TrainingCoordinator",
     "TrainingRunConfig",
+    "THETA_PARENT",
+    "THETA_PRODUCERS",
+    "FULL_SEQUENCE_ALIASES",
     "DistributedTrainingConfig",
     "CHECKPOINT_KINDS",
     "CheckpointRegistry",

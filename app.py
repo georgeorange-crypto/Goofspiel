@@ -420,6 +420,8 @@ async def new_game(req: Optional[NewGameRequest] = None) -> Dict[str, Any]:
         #          BOT_NASH        ↔ TIE_RULE_DISCARD  (经典平局弃奖)
         #          BOT_NASH_CARRY  ↔ TIE_RULE_ROLLOVER (平局滚入)
         #        TIE_RULE_SPLIT  与任一精确 Nash 奖牌型均不兼容 (无 Solver 支持)
+        #        兼容契约: BOT_NASH + rollover 允许开局使用 classic table,
+        #        但一旦 carry_pool>0, NashBot._choose 会逐回合诚实回落并解释原因。
         incompat_reasons: List[str] = []
         if is_any_exact_nash:
             if any_veil_on:
@@ -431,7 +433,10 @@ async def new_game(req: Optional[NewGameRequest] = None) -> Dict[str, Any]:
             # tie-rule ↔ solver 奖牌型一致性检查
             solver_model = EXACT_MODE_CLASSIC if requested_bot == BOT_NASH else EXACT_MODE_CARRY
             required_tie = TIE_RULE_DISCARD if requested_bot == BOT_NASH else TIE_RULE_ROLLOVER
-            if v_tie != required_tie:
+            runtime_carry_fallback_supported = (
+                requested_bot == BOT_NASH and v_tie == TIE_RULE_ROLLOVER
+            )
+            if v_tie != required_tie and not runtime_carry_fallback_supported:
                 incompat_reasons.append(
                     f"TieRule 不匹配: 当前规则={v_tie!r} (§29), "
                     f"但所选精确 Nash={BOT_DESCRIPTIONS.get(requested_bot)!r} 内部奖牌型={solver_model!r} "

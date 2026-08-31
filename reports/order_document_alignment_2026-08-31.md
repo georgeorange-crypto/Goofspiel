@@ -1,16 +1,16 @@
 # order 文档逐一对齐验收报告
 
-日期：2026-08-31（**修订 2：深度规格钉住 + 契约类缺口修复**）
-范围：`order/` 下 13 份 Markdown 文档、`REQUIREMENTS_TRACE.md`、训练/推理/评测/可观测性代码、CUDA smoke 产物、**2026-08-31 追加的 8 条深度规格断言测试**、Web/HTTP/双 Nash 契约类修复。
+日期：2026-08-31（**修订 3：14/14 order 文档 trace 补齐 + 全量回归通过**）
+范围：`order/` 下 14 份 Markdown 文档、`REQUIREMENTS_TRACE.md`、训练/推理/评测/可观测性代码、CUDA smoke 产物、**2026-08-31 追加的 8 条深度规格断言测试**、Web/HTTP/双 Nash 契约类修复。
 
 ## 总体结论
 
-`order/` 中 13 份文档已经逐一映射到实现与测试。经过本次修订 2：**用户指出的 6 项"不足"（P1 多任务、P2/P3 teacher、P5 adaptive、P6 league、P7 red-team、正式评测缺口）已经做了分类处理**：前 5 项是"代码已存在但之前 (a) 报告没写 (b) 没 pytest 断言钉住"，已补齐 8 条断言 + 更新对应文档段落；最后 1 项"正式评测缺口"明确归类为**长时 GPU 计算实验**，不是代码与文档对齐问题。
+`order/` 中 14 份文档已经逐一映射到实现与测试。经过本次修订 3：**用户指出的 6 项"不足"（P1 多任务、P2/P3 teacher、P5 adaptive、P6 league、P7 red-team、正式评测缺口）已经做了分类处理**：前 5 项是"代码已存在但之前 (a) 报告没写 (b) 没 pytest 断言钉住"，已补齐 8 条断言 + 更新对应文档段落；最后 1 项"正式评测缺口"明确归类为**长时 GPU 计算实验**，不是代码与文档对齐问题。新增发现的 `VEIL：匿名信息竞价游戏设计方案.md` 也已作为 `ORDER-014` 纳入 trace。
 
 当前验收边界：
 
 - 代码级需求对齐：✅ **通过（深度规格 level，非 skeleton）**。
-- 自动化测试对齐：✅ **训练 pipeline 测试 102 passed / 0 failed**（含 8 条新增深度规格断言）。
+- 自动化测试对齐：✅ **全量 pytest 165 passed / 0 failed**（含 8 条新增深度规格断言）。
 - Web/HTTP + 双 Nash + Env + Solver 组合基线：✅ **exit 0 passed**（Nash carry fallback value=有限、step int PlayerId 兼容、顶层 ai_policy 别名均已修复）。
 - 本机 CUDA smoke 训练（P0-P7）：✅ 通过（保留前次 GPU 实测证据）。
 - N=13 stage4 入口启动：✅ 通过。
@@ -20,8 +20,9 @@
 
 ```text
 REQUIREMENTS_TRACE validate script: OK
-训练 pipeline 测试（含 8 条深度规格）: 102 passed, 2 warnings  (0:01:49)
-Web/Env/Solver + 双 Nash 组合基线:      全部通过 exit 0
+trace 单测:                                1 passed
+双 Nash 目标回归:                          2 passed, 1 warning
+全量 pytest:                               165 passed, 8 warnings (0:02:11)
 前次 CUDA P0-P7 smoke pipeline:        ok=True, device=cuda, steps=1
 前次 N=13 stage4 self-play 启动:        ok=True, transitions=13, replay=1
 ```
@@ -54,7 +55,7 @@ Web/Env/Solver + 双 Nash 组合基线:      全部通过 exit 0
 | Nash-classic 遇 carry 回落 Heuristic → `value=NaN` 不可展示 | `bots.py::NashBot._fallback` 仅在 reason 含 `carry_pool=` 时写 `info["value"]=0.0`（大 N 超上限回落仍保留 NaN 旧契约） | 规则不兼容类回落给"保守有限值"便于 UI 分布条显示；不破坏老契约 |
 | `GoofspielEnv.step({0: card, 1: card})` 旧式数字 PlayerId 报错 | `env.py::step` 开头加 `if 0 in actions or 1 in actions: 重映射为 PLAYER_0/PLAYER_1` | 老测试/旧脚本传 int key 不再 KeyError；新调用字符串 PlayerId 零影响 |
 
-## 逐文档对齐（修订 — 重点更新 P1/P2/P3/P5/P6/P7 对应文档段落）
+## 逐文档对齐（修订 — 重点更新 P1/P2/P3/P5/P6/P7 与 VEIL 对应文档段落）
 
 ### 1. `Goofspiel 游戏规则说明书.md`
 
@@ -301,11 +302,28 @@ Web/Env/Solver + 双 Nash 组合基线:      全部通过 exit 0
 
 验收：通过。DDP/rank0/checkpoint/H200 plan/trace ledger 均已落地。
 
+### 14. `VEIL：匿名信息竞价游戏设计方案.md`
+
+要求重点：隐藏奖励、信息奖励、花色 tie-break、三类 tie_rule、信息粒度、以及精确 Nash 与规则变体不兼容时的诚实回落。
+
+实现：
+
+- `goofspiel/env.py`
+- `app.py`
+- `static/app.js`
+
+测试：
+
+- `tests/test_env.py`
+- `tests/test_app.py`
+
+验收：通过。VEIL flag、`info_bits_mode`、`tie_rule`、前端机制选项、Nash/classic 与 Nash-carry 的规则兼容/回落契约均有实现；`BOT_NASH + rollover` 允许启动 classic table，但一旦出现 `carry_pool>0` 会逐回合 fallback 并在 `ai_policy.note` 明示原因；`BOT_NASH_CARRY + rollover` 保持精确 carry-over 路径。
+
 ## Trace 强化
 
 本次已更新：
 
-- `REQUIREMENTS_TRACE.md` 新增 `ORDER-001` 到 `ORDER-013`，确保 13 份文档逐一出现。
+- `REQUIREMENTS_TRACE.md` 新增 `ORDER-001` 到 `ORDER-014`，确保 14 份文档逐一出现。
 - `scripts/validate_requirements_trace.py` 新增强制检查：`order/*.md` 中任何文档未出现在 trace 中都会失败。
 
 验证：

@@ -1,7 +1,7 @@
 # Goofspiel-13 训练进度分析报告
 
-日期：2026-08-31（**第三次修订：深度规格补齐并钉住测试**）
-审计重点：P1 多任务预训练闭环、P2/P3 teacher ensemble/disagreement/EMA 多来源调度、P5 多策略 opponent curriculum+oracle switch、P6 真实 cross-play 矩阵、P7 focused correction+regression、所有新增断言均有自动化测试做证据（而非口头宣称）。
+日期：2026-08-31（**第四次修订：按 order 14/14 补齐 trace，并完成全量回归**）
+审计重点：P1 多任务预训练闭环、P2/P3 teacher ensemble/disagreement/EMA 多来源调度、P5 多策略 opponent curriculum+oracle switch、P6 真实 cross-play 矩阵、P7 focused correction+regression、VEIL 文档映射、Web/HTTP 双 Nash 契约、全量 pytest 与 CUDA smoke 证据。
 
 ## 总结结论
 
@@ -20,7 +20,12 @@
   - app.py 顶层 `ai_policy` 别名 + `last_round.ai_policy`（新旧前端双兼容，`play()` 响应）
   - Nash carry 规则不兼容回落 → `value=0.0`（有限展示值，不再 NaN；大 N 超上限回落仍保留 NaN，不破坏原契约）
   - `GoofspielEnv.step` 兼容旧式 `{0,1}` int 键 → 自动映射到字符串 `PLAYER_0/PLAYER_1`（`env.py` L202-206）
-  - 双 Nash 独立 solver/policy cache + 诚实回落契约 89 pytest 全通过
+  - `BOT_NASH + rollover` 启动时保留 classic Nash 表，遇到 `carry_pool>0` 再逐回合诚实 fallback；`BOT_NASH_CARRY + rollover` 保持精确路径
+  - 双 Nash 独立 solver/policy cache + 诚实回落契约已由全量 pytest 覆盖
+
+- **order trace（已验证）：✅ 14/14 文档全部登记**
+  - `REQUIREMENTS_TRACE.md` 已新增 `ORDER-014 | order/VEIL：匿名信息竞价游戏设计方案.md`
+  - `scripts/validate_requirements_trace.py` 与 `tests/unit/training/test_requirements_trace.py` 均通过
 
 - **尚不能宣称的项目（需要长时 GPU 运行，非代码缺口）：❌ 仍未执行**
   - STANDARD/FULL/RELEASE 统计显著 benchmark（QUICK 已有；STANDARD 建议 games=200+ × 全 E0-E7，1~8 小时 GPU）
@@ -74,20 +79,20 @@ device NVIDIA GeForce RTX 4060 Laptop GPU
 ### 训练 pipeline 测试（本轮修订 3 新增 + 存量）
 
 ```text
-.\.venv\Scripts\python.exe -m pytest tests/unit/training/test_training_pipeline.py -q
-102 passed, 2 warnings (0:01:49)
+.\.venv\Scripts\python.exe -m pytest -q
+165 passed, 8 warnings (0:02:11)
 ```
 
-**102 条测试**（含修订 3 追加的 8 条深度规格断言）**全部通过**。新增的 8 条直接钉住上表列出的 P1/P2/P3/P5/P6/P7 深度规格。
+**165 条全量测试**（含修订 3 追加的 8 条深度规格断言、修订 4 的 trace 14/14 覆盖、Web/HTTP 双 Nash 契约）**全部通过**。
 
 ### Web/HTTP + 双 Nash + 环境 + Solver 组合基线全仓
 
 ```text
-.\.venv\Scripts\python.exe -m pytest tests/test_env.py tests/test_app.py tests/test_solver.py tests/unit/training/test_training_pipeline.py -q
-102 passed
+.\.venv\Scripts\python.exe -m pytest tests/test_app.py::TestNashBot::test_nash_n5_exact_policy_values tests/test_app.py::TestDualNash::test_carry_over_split_contract_tie_then_round2 -q
+2 passed, 1 warning (0:00:39)
 ```
 
-exit code 0，无失败。之前暴露的两个契约缺口：`Nash fallback carry→value 有限值` 与 `step 数字 PlayerId 兼容` 已分别在 `bots.py::_fallback`（`carry_pool=` reason → `value=0.0`）与 `env.py::step`（int 键自动映射字符串 PlayerId）处修复。
+exit code 0，无失败。之前暴露的三个契约缺口：`Nash fallback carry→value 有限值`、`step 数字 PlayerId 兼容`、`/api/game/play` 顶层 `ai_policy` 别名已分别在 `bots.py::_fallback`、`env.py::step`、`app.py::play` 修复。
 
 ### 前期 CUDA P0-P7 smoke（保留证据，修订 2 已跑通）
 
@@ -171,7 +176,7 @@ P6 的 3×3 真实 cross-play + PFSP 已有；league distillation 需要多轮 s
 - 环境配置：✅ 通过。
 - 本机 GPU 可用性：✅ 通过。
 - P0-P7 训练代码深度规格实现：✅ 全部按 `order/` 口径补齐（**代码有锚点，pytest 有断言**）。
-- 训练 pipeline 测试：✅ **102 passed / 0 failed / 2 warnings**。
+- 全量 pytest：✅ **165 passed / 0 failed / 8 warnings**。
 - Web/HTTP/Dual Nash/Env/Solver 组合基线：✅ 全绿 exit 0。
 - CUDA P0-P7 smoke：✅ ok=True（保留前次 GPU 实测证据）。
 - N=13 stage4 入口启动：✅ 通过。

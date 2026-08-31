@@ -22,4 +22,9 @@ def validate_checkpoint_resume(path: str | Path) -> dict[str, Any]:
         "has_rng_state": bool(rng_state),
         "has_model_state": bool(payload.get("model_state")),
         "has_target_model_state": "target_model_state" in payload.get("extra", {}),
+        # 3.1b lineage — who this checkpoint descends from.
+        "parent_checkpoint_id": metadata.get("parent_checkpoint_id"),
+        "init_checkpoint_id": metadata.get("init_checkpoint_id"),
+        "model_config_hash": metadata.get("model_config_hash"),
+        "optimizer_reset": metadata.get("optimizer_reset"),
     }

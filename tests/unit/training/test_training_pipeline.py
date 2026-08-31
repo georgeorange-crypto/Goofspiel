@@ -106,10 +106,16 @@ def test_stage5_builds_opponent_session_calibration(tmp_path: Path):
     ).run()
     assert result["ok"] is True
     metrics = result["metrics"]["metrics"]
-    assert metrics["opponent_model_usable"] == 1.0
+    # Phase 0.2 honesty: P5 does not train an opponent model yet, so it must
+    # report the model as NOT usable (0.0), not fabricate 1.0.
+    assert metrics["opponent_model_usable"] == 0.0
     assert metrics["opponent_sessions"] == 3.0
     assert metrics["opponent_regimes"] == 3.0
     assert metrics["oracle_gain"] >= 0.0
+    # The NLL is the uniform *reference*, not a trained model's calibration — the
+    # field is named to say so, and the old ece==0.0 fabrication is gone.
+    assert "uniform_reference_nll" in metrics
+    assert "opponent_ece" not in metrics
     assert (tmp_path / "stage5" / "adaptive" / "opponent_sessions.jsonl").exists()
     assert (tmp_path / "stage5" / "adaptive" / "adaptive_gate_report.json").exists()
 
@@ -136,8 +142,10 @@ def test_stage7_writes_redteam_reanalysis(tmp_path: Path):
     assert metrics["corrections"] == 3.0
     assert metrics["teacher_relabels"] == 3.0
     assert metrics["focused_correction_steps"] == 3.0
-    assert metrics["original_attack_regression_passed"] == 1.0
-    assert metrics["general_regression_passed"] == 1.0
+    # Phase 0.2 honesty: no regression suite runs in P7 yet (Phase 4.4), so the
+    # pass/fail metric keys must be absent rather than fabricated as 1.0.
+    assert "original_attack_regression_passed" not in metrics
+    assert "general_regression_passed" not in metrics
     assert (tmp_path / "stage7" / "redteam" / "redteam_report.json").exists()
     assert (tmp_path / "stage7" / "redteam" / "focused_correction_report.json").exists()
 
@@ -322,6 +330,8 @@ def test_stage7_focused_correction_and_regression_report(tmp_path: Path):
     assert tp["steps"] >= 1
     assert "source" in tp
     reg = report["regression"]
-    assert bool(reg["original_attack_regression_passed"]) is True
-    assert bool(reg["general_regression_passed"]) is True
-    assert 0.0 <= float(reg["recurrence"]) <= 1.0
+    # Phase 0.2 honesty: no regression is actually executed in P7 yet (Phase 4.4).
+    # The report must carry explicit null (unrun), never a fabricated pass/recurrence.
+    assert reg["original_attack_regression_passed"] is None
+    assert reg["general_regression_passed"] is None
+    assert reg["recurrence"] is None

@@ -129,12 +129,12 @@ def run_unified_benchmark(profile: EvaluationProfile | None = None) -> Benchmark
     arenas["E2_N13_ROBUST"] = _seeded_matchups(profile, n_cards=13)
     arenas["E3_OPPONENT_MODELING"] = {
         "rows": [
-            {"benchmark": "uniform_reference", "nll": math.log(13), "brier": 12 / 13, "ece": 0.0, "switch_delay": 0.0, "gate": "PASS_REFERENCE"}
+            {"benchmark": "uniform_reference", "nll": math.log(13), "brier": 12 / 13, "ece": 0.0, "switch_delay": 0.0, "gate": "REFERENCE_ROW_NOT_A_RESULT"}
         ]
     }
     arenas["E4_ADAPTIVE_SAFETY"] = {
         "rows": [
-            {"benchmark": "safety_reference", "adaptive_gain": 0.0, "oracle_gain": 0.0, "risk_increase": 0.0, "gate": "PASS_REFERENCE"}
+            {"benchmark": "safety_reference", "adaptive_gain": 0.0, "oracle_gain": 0.0, "risk_increase": 0.0, "gate": "REFERENCE_ROW_NOT_A_RESULT"}
         ],
     }
     try:
@@ -163,20 +163,26 @@ def run_unified_benchmark(profile: EvaluationProfile | None = None) -> Benchmark
     }
     if profile.include_e7:
         arenas["E7_LEAGUE_REDTEAM"] = {
-            "rows": [{"forgetting": 0.0, "correction_success": 1.0, "recurrence": 0.0, "gate": "PASS_REFERENCE"}]
+            "rows": [{"forgetting": 0.0, "correction_success": 1.0, "recurrence": 0.0, "gate": "REFERENCE_ROW_NOT_A_RESULT"}]
         }
 
+    # Gate discipline (Phase 0.2): a gate is True only when a real check computed
+    # it; a gate that no arena actually evaluates yet is None (unknown), never a
+    # literal True. `all(...)` treats None as falsy, so promotion cannot ride on
+    # an unrun gate. The reference-row arenas (E3/E4/E7) prove only that a row
+    # exists — that is NOT a calibration/safety result, so those gates are None
+    # until a real evaluator fills them (Phases 4-5).
     hard_gates = {
         "G0_integrity": bool(arenas["E0_MATHEMATICAL_CORRECTNESS"]["passed"]),
-        "G1_exact_regression": True,
+        "G1_exact_regression": None,
         "G2_exploitability": not math.isnan(arenas["E2_N13_ROBUST"]["mean_score_diff"]),
-        "G3_historical": True,
-        "G4_regression_suite": True,
-        "G5_opponent_calibration": bool(arenas["E3_OPPONENT_MODELING"]["rows"]),
-        "G6_adaptive_safety": bool(arenas["E4_ADAPTIVE_SAFETY"]["rows"]),
-        "G7_numerical_performance": True,
+        "G3_historical": None,
+        "G4_regression_suite": None,
+        "G5_opponent_calibration": None,
+        "G6_adaptive_safety": None,
+        "G7_numerical_performance": None,
     }
-    decision = "PROMOTE_CANDIDATE" if all(hard_gates.values()) else "REJECT_CANDIDATE"
+    decision = "PROMOTE_CANDIDATE" if all(bool(v) for v in hard_gates.values()) else "REJECT_CANDIDATE"
     return BenchmarkReport(
         benchmark_version=BENCHMARK_VERSION,
         schema_version=SCHEMA_VERSION,

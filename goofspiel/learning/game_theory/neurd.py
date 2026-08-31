@@ -25,7 +25,17 @@ def neurd_loss(
     self_mask: Tensor,
     opp_mask: Tensor,
 ) -> Tensor:
-    """NeuRD loss on raw logits, not log-softmax policy gradient."""
+    """NeuRD loss on raw logits, not log-softmax policy gradient.
+
+    WARNING (Phase 1.1): this variant contracts Q with ``max`` over opponent
+    actions (``:max(dim=-1)`` below), i.e. it assumes the BEST-case opponent on
+    the self-payoff Q — the opposite of robust.  It is NOT wired into the P4
+    robust actor anymore; ``row_action_regret`` (contracting Q against the RM+
+    equilibrium column policy) is used instead.  Kept only for the raw-logit
+    gradient-direction characterisation test; do not use for robust training
+    without first replacing the ``max`` reduction with a policy-weighted
+    contraction.
+    """
     col_policy = F.softmax(logits_opp.masked_fill(~opp_mask.bool(), -1e9), dim=-1)
     del col_policy
     action_value = q_matrix.detach().float().masked_fill(~opp_mask.bool().unsqueeze(1), -1e9).max(dim=-1).values

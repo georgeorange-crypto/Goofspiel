@@ -52,6 +52,17 @@ def solve_exact_tool(
     opp_mask = torch.zeros(13, dtype=torch.bool)
     self_mask[[a - 1 for a in state.self_actions]] = True
     opp_mask[[a - 1 for a in state.opponent_actions]] = True
+    # `exact_teacher_for_current_prize` solves the *immediate* Q-matrix only; it
+    # ignores continuation value. That is the exact full-game matrix only on the
+    # last round (no future prizes to reveal, `prize_mask == 0`). For any earlier
+    # state it is an approximation, so we must not stamp NUMERICAL_EXACT there —
+    # doing so was the dishonest label. Terminal round -> exact; otherwise
+    # APPROXIMATE, with a diagnostic recording why.
+    is_last_round = state.prize_mask == 0
+    exactness = Exactness.NUMERICAL_EXACT if is_last_round else Exactness.APPROXIMATE
+    diagnostics: dict[str, Any] = {"solver": sample.solver_precision, "is_last_round": bool(is_last_round)}
+    if not is_last_round:
+        diagnostics["approximation"] = "IMMEDIATE_MATRIX_IGNORES_CONTINUATION_VALUE"
     return GameToolResult(
         source="EXACT_NASH",
         mode=mode.value,
@@ -61,10 +72,10 @@ def solve_exact_tool(
         value=float(sample.value),
         valid_self_mask=self_mask,
         valid_opponent_mask=opp_mask,
-        quality_score=10.0,
-        exactness=Exactness.NUMERICAL_EXACT.value,
+        quality_score=10.0 if is_last_round else 5.0,
+        exactness=exactness.value,
         runtime_ms=(time.perf_counter() - started) * 1000.0,
         state_key=getattr(sample.state, "state_hash", None),
-        diagnostics={"solver": sample.solver_precision},
+        diagnostics=diagnostics,
         valid=True,
     )

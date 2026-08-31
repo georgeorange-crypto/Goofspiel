@@ -25,6 +25,18 @@ class CheckpointMetadata:
     git_commit: str | None = None
     python_version: str = platform.python_version()
     created_at: float = field(default_factory=time.time)
+    # --- 3.1b lineage contract -------------------------------------------------
+    # These make a chained run auditable: which checkpoint's θ this stage was
+    # initialised from, which run it resumed, the architecture signature the
+    # weights were trained against, and whether the optimizer was reset (a stage
+    # transition) or restored (a crash resume).  Lineage should read like
+    # ``stage4_robust ⟵ stage3_sft ⟵ stage1_pretrain``, not merely "the file exists".
+    parent_checkpoint_id: str | None = None      # the checkpoint this run continued from
+    init_checkpoint_id: str | None = None        # θ-only source (init_from_checkpoint)
+    model_config_hash: str | None = None         # architecture (named-param shape) signature
+    dataset_manifest_ids: list[str] = field(default_factory=list)
+    teacher_dataset_ids: list[str] = field(default_factory=list)
+    optimizer_reset: bool = False                # True = fresh optimizer (stage boundary)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -91,3 +103,94 @@ def load_checkpoint(path: str | Path, *, verify_checksum: bool = True) -> dict[s
         if manifest.get("sha256") != actual:
             raise RuntimeError(f"checkpoint checksum mismatch for {path}: {actual}")
     return torch.load(path, map_location="cpu")
+
+
+def model_config_hash(model: Any) -> str:
+    """A stable signature of the architecture (named-param shapes and dtypes).
+
+    Two models with the same signature can exchange ``state_dict``s; a mismatch
+    means an ``init_from_checkpoint`` would silently reshape or partially load.
+    Used to stamp lineage and to guard weight-inheritance across a stage boundary.
+    """
+    parts = [f"{name}:{tuple(p.shape)}:{p.dtype}" for name, p in model.state_dict().items()]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def init_from_checkpoint(
+    model: Any,
+    path: str | Path,
+    *,
+    strict: bool = True,
+    verify_config: bool = True,
+) -> dict[str, Any]:
+    """**Stage transition** load: copy θ (model weights) ONLY, nothing else.
+
+    This is the P1→P3→P4 seam.  It restores the *parameters* so the next stage
+    starts from the previous stage's learned representation, but deliberately
+    leaves the optimizer, scheduler, RNG, replay, and global-step at their fresh
+    values — the new stage owns a new optimization problem.  It is intentionally
+    NOT :func:`resume_checkpoint`: conflating "inherit weights" with "resume a
+    crashed run" is the exact research accident this split prevents.
+
+    Returns a small provenance dict (``init_checkpoint_id``, source ``sha256``,
+    ``model_config_hash``) to stamp into the new checkpoint's lineage metadata.
+    """
+    payload = load_checkpoint(path)
+    if verify_config:
+        want = payload.get("metadata", {}).get("model_config_hash")
+        have = model_config_hash(model)
+        if want is not None and want != have:
+            raise RuntimeError(
+                f"init_from_checkpoint architecture mismatch for {path}: "
+                f"source model_config_hash={want} != target {have}"
+            )
+    model.load_state_dict(payload["model_state"], strict=strict)
+    meta = payload.get("metadata", {})
+    return {
+        "init_checkpoint_id": meta.get("checkpoint_id"),
+        "init_checkpoint_path": str(path),
+        "init_checkpoint_sha256": sha256_file(path),
+        "init_global_step": int(meta.get("global_step", 0)),
+        "model_config_hash": model_config_hash(model),
+    }
+
+
+def resume_checkpoint(
+    model: Any,
+    path: str | Path,
+    *,
+    optimizers: dict[str, Any] | None = None,
+    target_model: Any | None = None,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """**Crash recovery** load: restore the FULL training state, not just θ.
+
+    Restores model weights, every named optimizer, the target network (if the
+    checkpoint carries ``extra['target_model_state']``), and returns the stored
+    ``global_step`` / ``rng_state`` / ``extra`` so the caller can continue the
+    *same* run where it stopped.  This is the counterpart to
+    :func:`init_from_checkpoint`; the two are never conflated.
+    """
+    payload = load_checkpoint(path)
+    model.load_state_dict(payload["model_state"], strict=strict)
+    restored_opt = []
+    if optimizers:
+        stored = payload.get("optimizer_states", {})
+        for name, opt in optimizers.items():
+            if name in stored:
+                opt.load_state_dict(stored[name])
+                restored_opt.append(name)
+    extra = payload.get("extra", {})
+    if target_model is not None and "target_model_state" in extra:
+        target_model.load_state_dict(extra["target_model_state"], strict=strict)
+    meta = payload.get("metadata", {})
+    return {
+        "parent_checkpoint_id": meta.get("checkpoint_id"),
+        "resume_checkpoint_path": str(path),
+        "resume_sha256": sha256_file(path),
+        "global_step": int(meta.get("global_step", 0)),
+        "restored_optimizers": restored_opt,
+        "restored_target_model": target_model is not None and "target_model_state" in extra,
+        "rng_state": payload.get("rng_state", {}),
+        "extra": extra,
+    }

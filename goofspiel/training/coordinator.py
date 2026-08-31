@@ -34,6 +34,11 @@ class TrainingRunConfig:
     num_corpus_games: int = 32
     n_cards: int = 5
     dry_run: bool = False
+    # Phase 3.1 — two DISTINCT, never-conflated checkpoint seams:
+    #   init_from_checkpoint: stage transition (θ-only, fresh optimizer/step-0)
+    #   resume_checkpoint:    crash recovery (full model+optimizer+target+step)
+    init_from_checkpoint: str | None = None
+    resume_checkpoint: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,6 +80,8 @@ class TrainingCoordinator:
                 out_dir=self.artifact_dir / "checkpoints",
                 device=self.config.device,
                 n_cards=self.config.n_cards,
+                init_from_checkpoint=self.config.init_from_checkpoint,
+                resume_checkpoint=self.config.resume_checkpoint,
             )
             return {"stage": stage, "ok": True, "metrics": asdict(metrics)}
         if stage == "stage3_sft":
@@ -84,6 +91,8 @@ class TrainingCoordinator:
                 out_dir=self.artifact_dir / "checkpoints",
                 device=self.config.device,
                 n_cards=self.config.n_cards,
+                init_from_checkpoint=self.config.init_from_checkpoint,
+                resume_checkpoint=self.config.resume_checkpoint,
             )
             return {"stage": stage, "ok": True, "metrics": asdict(metrics)}
         if stage == "stage2_semi_supervised":
@@ -100,6 +109,8 @@ class TrainingCoordinator:
                 out_dir=self.artifact_dir / "checkpoints",
                 device=self.config.device,
                 n_cards=self.config.n_cards,
+                init_from_checkpoint=self.config.init_from_checkpoint,
+                resume_checkpoint=self.config.resume_checkpoint,
             )
             return {"stage": stage, "ok": True, "metrics": asdict(metrics)}
         if stage == "stage5_adaptive":

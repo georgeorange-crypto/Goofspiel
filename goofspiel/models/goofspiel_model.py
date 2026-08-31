@@ -59,28 +59,97 @@ class ResidualMatrixBlock(nn.Module):
         return out
 
 
-class SimpleMambaMemory(nn.Module):
-    """Mamba-compatible long-memory fallback without an external dependency.
+class SelectiveStateSpaceMemory(nn.Module):
+    """Selective state-space (Mamba / S6) inter-game memory.
 
-    It uses depthwise temporal convolution plus a GRU gate.  The class keeps
-    the lifecycle and interface distinct from LSTM so the rest of the project
-    can use a state-space memory implementation through the same caller API.
+    A genuine selective SSM, **not** a GRU.  It maintains a recurrent state
+    ``h_t`` over the *games* (time) dimension and updates it with
+    *input-dependent* (selective) discretization parameters Δ, B, C — the
+    defining feature of Mamba/S6 over a linear-time-invariant SSM.  The
+    recurrence
+
+        hₜ = exp(Δₜ ⊙ A) ⊙ hₜ₋₁ + (Δₜ ⊙ Bₜ) xₜ
+        yₜ = Σ_state Cₜ · hₜ + D ⊙ xₜ
+
+    is evaluated by an explicit **scan** along the time axis, so the state truly
+    propagates across games.  A GRU gate carries no such SSM state, and a
+    depthwise conv of width ``d_conv`` cannot move information more than
+    ``d_conv-1`` steps — only this scan lets game 0 influence the output at the
+    final game.  Returns the output at each sequence's last valid step, matching
+    the caller API of the old placeholder.
     """
 
-    def __init__(self, input_dim: int = 192, hidden_dim: int = 192):
+    def __init__(
+        self,
+        input_dim: int = 192,
+        hidden_dim: int = 192,
+        *,
+        d_state: int = 16,
+        d_conv: int = 3,
+        expand: int = 2,
+    ) -> None:
         super().__init__()
-        self.in_proj = nn.Linear(input_dim, hidden_dim)
-        self.depthwise = nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim)
-        self.gate = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.d_inner = expand * hidden_dim
+        self.dt_rank = max(1, self.d_inner // 16)
+
+        # x and the SiLU gate z, produced together.
+        self.in_proj = nn.Linear(input_dim, 2 * self.d_inner)
+        # Short causal depthwise conv over time (local mixing before the scan).
+        self.conv1d = nn.Conv1d(
+            self.d_inner, self.d_inner, d_conv, groups=self.d_inner, padding=d_conv - 1
+        )
+        # Selective (input-dependent) Δ, B, C projections.
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        # State matrix A (diagonal, negative real via -exp) and skip D.
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, memory: OpponentMemoryBatch | None, batch: int, device: torch.device) -> Tensor:
+    def _scan(self, x: Tensor) -> Tensor:
+        """Run the selective SSM scan over the time dimension of ``x``.
+
+        ``x`` is (batch, length, d_inner) post-conv/activation; returns the SSM
+        output (batch, length, d_inner) *before* the gate and output projection.
+        """
+        b, length, _ = x.shape
+        A = -torch.exp(self.A_log)  # (d_inner, d_state), stable (Re(A) < 0)
+        proj = self.x_proj(x)  # (b, L, dt_rank + 2*d_state)
+        dt, B_mat, C_mat = torch.split(
+            proj, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        delta = F.softplus(self.dt_proj(dt))  # (b, L, d_inner), input-dependent Δ
+        # Zero-order-hold discretization (selective: everything depends on x).
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (b, L, d_inner, d_state)
+        deltaB_x = delta.unsqueeze(-1) * B_mat.unsqueeze(2) * x.unsqueeze(-1)
+
+        h = torch.zeros(b, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(length):
+            h = deltaA[:, t] * h + deltaB_x[:, t]  # recurrent state carried forward
+            ys.append((h * C_mat[:, t].unsqueeze(1)).sum(dim=-1))  # (b, d_inner)
+        y = torch.stack(ys, dim=1)  # (b, L, d_inner)
+        return y + x * self.D
+
+    def forward(
+        self, memory: OpponentMemoryBatch | None, batch: int, device: torch.device
+    ) -> Tensor:
         if memory is None:
-            return torch.zeros(batch, self.norm.normalized_shape[0], device=device)
-        x = self.in_proj(memory.game_summary_sequence.float())
-        x = self.depthwise(x.transpose(1, 2)).transpose(1, 2)
+            return torch.zeros(batch, self.hidden_dim, device=device)
+        xz = self.in_proj(memory.game_summary_sequence.float())
+        x, z = xz.chunk(2, dim=-1)  # (b, L, d_inner) each
+        length = x.shape[1]
+        x = self.conv1d(x.transpose(1, 2))[..., :length].transpose(1, 2)
         x = F.silu(x)
-        out, _ = self.gate(x)
+        y = self._scan(x)
+        y = y * F.silu(z)  # gated output, Mamba-style
+        out = self.out_proj(y)  # (b, L, hidden_dim)
         mask = memory.valid_mask.to(dtype=out.dtype)
         idx = mask.sum(dim=1).long().clamp_min(1) - 1
         last = out[torch.arange(out.shape[0], device=out.device), idx]
@@ -131,7 +200,9 @@ class GoofspielModel(nn.Module):
 
         self.rank_encoder = RankEncoder(64)
         self.global_encoder = nn.Sequential(
-            nn.Linear(8, 128), nn.SiLU(), nn.Linear(128, d_model), nn.LayerNorm(d_model)
+            # 10 global features (Phase 1.2 added carry_norm + stake_norm to the
+            # original 8).
+            nn.Linear(10, 128), nn.SiLU(), nn.Linear(128, d_model), nn.LayerNorm(d_model)
         )
         self.card_projector = nn.Sequential(
             nn.Linear(68, d_model), nn.LayerNorm(d_model), nn.SiLU(), nn.Linear(d_model, d_model)
@@ -177,7 +248,10 @@ class GoofspielModel(nn.Module):
         self.history_projector = nn.Sequential(nn.Linear(64 * 3 + 3, 128), nn.LayerNorm(128), nn.SiLU())
         self.intra_game_lstm = nn.LSTM(128, d_model, num_layers=2, dropout=0.05, batch_first=True)
         self.game_summary_projector = nn.Linear(d_model, d_model)
-        self.inter_game_mamba = SimpleMambaMemory(d_model, d_model)
+        # Phase 2.3: a genuine selective state-space model (Mamba/S6) with a
+        # scan-based recurrence over the games dimension — replaces the former
+        # GRU placeholder.  The attribute name is kept for a drop-in swap.
+        self.inter_game_mamba = SelectiveStateSpaceMemory(d_model, d_model)
         self.memory_fusion = nn.Sequential(nn.Linear(d_model * 3, d_model), nn.SiLU(), nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
         self.opp_short_head = nn.Sequential(nn.Linear(d_model * 3, d_model), nn.SiLU(), nn.Linear(d_model, 1))
         self.opp_long_head = nn.Sequential(nn.Linear(d_model * 3, d_model), nn.SiLU(), nn.Linear(d_model, 1))
@@ -211,6 +285,13 @@ class GoofspielModel(nn.Module):
             public_state.opponent_score.float() / total,
             (public_state.self_score.float() - public_state.opponent_score.float()) / total,
             remaining_mass / total,
+            # Phase 1.2: expose carry and stake directly so the network never has
+            # to re-derive `carry = S_N - remaining - current_prize - scores` just
+            # to recover the quantity the environment and the teacher already use.
+            # `stake = current_prize + carry` is exactly the value the game logic
+            # (`game/state.py`) and the teacher target (`stages.py`) key on.
+            public_state.carry_pool.float() / total,
+            (public_state.current_prize.float() + public_state.carry_pool.float()) / total,
         ], dim=-1)
 
     def _encode_public(self, s: PublicStateBatch) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -269,7 +350,14 @@ class GoofspielModel(nn.Module):
         sign = torch.sign(ri - rj)
         prize = s.current_prize.float()[:, None, None] / s.n_cards.float().clamp_min(1)[:, None, None]
         total = s.n_cards.float() * (s.n_cards.float() + 1.0) / 2.0
-        immediate = s.current_prize.float()[:, None, None] * sign / total[:, None, None]
+        # Phase 1.2: the immediate payoff magnitude is the STAKE at risk this
+        # round = current_prize + carry_pool, matching `_immediate_target`
+        # (stages.py) and the game logic (`game/state.py`, `stake = current_prize
+        # + carry_pool`). Using current_prize alone handed the model a feature that
+        # contradicted the label it was trained toward (e.g. carry=13,prize=3 is a
+        # stake-16 round, not a stake-3 round).
+        stake = s.current_prize.float() + s.carry_pool.float()
+        immediate = stake[:, None, None] * sign / total[:, None, None]
         small = torch.stack([ri, rj, ri - rj, (ri - rj).abs(), sign, prize.expand_as(ri), immediate], dim=-1)
         return self.pair_projector(torch.cat([hs, ho, hp, small], dim=-1))
 
@@ -398,3 +486,85 @@ class GoofspielModel(nn.Module):
         counts["total"] = sum(p.numel() for p in self.parameters())
         counts["trainable"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return counts
+
+    # ------------------------------------------------------------------
+    # Explicit robust / adaptive parameter partition (Phase 3.2b firewall).
+    #
+    # The Idea-Fidelity rule is *Adaptive must not pollute Robust*: Q_R ⊥ Q_A.
+    # The forward pass enforces it with `.detach()` (goofspiel_model.py:~420),
+    # but a `.detach()` is one refactor away from silently leaking gradient into
+    # the robust backbone.  So P5 must *freeze the robust parameters explicitly*
+    # rather than trusting detach alone.  These two methods name the partition
+    # and are asserted to be disjoint and exhaustive, so the split cannot rot as
+    # modules are added.
+    # ------------------------------------------------------------------
+    def _robust_modules(self) -> dict[str, nn.Module]:
+        """The opponent-AGNOSTIC robust path: public encoder + robust matrix/heads.
+
+        These are frozen while the adaptive/opponent branches train (P5)."""
+        return {
+            "rank_encoder": self.rank_encoder,
+            "global_encoder": self.global_encoder,
+            "card_projector": self.card_projector,
+            "card_transformer": self.card_transformer,
+            "role_embed": self.role_embed,
+            "node_projector": self.node_projector,
+            "gnn_layers": self.gnn_layers,
+            "gnn_global": self.gnn_global,
+            "t_to_action": self.t_to_action,
+            "g_to_action": self.g_to_action,
+            "card_gate": self.card_gate,
+            "global_fusion": self.global_fusion,
+            "pair_projector": self.pair_projector,
+            "matrix_in": self.matrix_in,
+            "matrix_blocks": self.matrix_blocks,
+            "matrix_out": self.matrix_out,
+            "q_head": self.q_head,
+            "policy_head": self.policy_head,
+            "value_head": self.value_head,
+        }
+
+    def _adaptive_modules(self) -> dict[str, nn.Module]:
+        """The opponent-CONDITIONED path: memory (LSTM/Mamba), opponent heads, and
+        the adaptive branch.  These are the only params P5 trains."""
+        return {
+            "history_projector": self.history_projector,
+            "intra_game_lstm": self.intra_game_lstm,
+            "game_summary_projector": self.game_summary_projector,
+            "inter_game_mamba": self.inter_game_mamba,
+            "memory_fusion": self.memory_fusion,
+            "opp_short_head": self.opp_short_head,
+            "opp_long_head": self.opp_long_head,
+            "opp_fused_head": self.opp_fused_head,
+            "adaptive_film": self.adaptive_film,
+            "adaptive_cnn": self.adaptive_cnn,
+            "adaptive_delta_heads": self.adaptive_delta_heads,
+            "adaptive_policy_head": self.adaptive_policy_head,
+            "adaptive_value_head": self.adaptive_value_head,
+        }
+
+    def robust_parameters(self) -> list[nn.Parameter]:
+        return [p for m in self._robust_modules().values() for p in m.parameters()]
+
+    def adaptive_parameters(self) -> list[nn.Parameter]:
+        return [p for m in self._adaptive_modules().values() for p in m.parameters()]
+
+    def assert_partition_is_complete(self) -> None:
+        """Fail loudly if robust ∪ adaptive is not an exact partition of the model.
+
+        Guards against a newly-added module silently belonging to neither group
+        (and thus escaping the P5 firewall) or to both."""
+        robust = {id(p) for p in self.robust_parameters()}
+        adaptive = {id(p) for p in self.adaptive_parameters()}
+        allp = {id(p) for p in self.parameters()}
+        overlap = robust & adaptive
+        missing = allp - robust - adaptive
+        if overlap:
+            raise AssertionError(f"{len(overlap)} parameter(s) are in BOTH robust and adaptive groups")
+        if missing:
+            raise AssertionError(f"{len(missing)} parameter(s) are in NEITHER robust nor adaptive group")
+
+    def set_robust_requires_grad(self, requires_grad: bool) -> None:
+        """Freeze (or unfreeze) exactly the robust parameters — the P5 firewall."""
+        for p in self.robust_parameters():
+            p.requires_grad_(requires_grad)

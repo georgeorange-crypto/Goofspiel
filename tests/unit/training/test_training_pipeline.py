@@ -95,27 +95,33 @@ def test_stage4_collects_selfplay_replay(tmp_path: Path):
     assert (tmp_path / "stage4" / "checkpoints" / "promotion" / "stage4_promotion.json").exists()
 
 
-def test_stage5_builds_opponent_session_calibration(tmp_path: Path):
+def test_stage5_trains_opponent_model_behind_firewall(tmp_path: Path):
     result = TrainingCoordinator(
         TrainingRunConfig(
             artifact_dir=str(tmp_path / "stage5"),
             stage="stage5_adaptive",
-            steps=3,
+            steps=8,
             n_cards=3,
         )
     ).run()
     assert result["ok"] is True
     metrics = result["metrics"]["metrics"]
-    # Phase 0.2 honesty: P5 does not train an opponent model yet, so it must
-    # report the model as NOT usable (0.0), not fabricate 1.0.
-    assert metrics["opponent_model_usable"] == 0.0
-    assert metrics["opponent_sessions"] == 3.0
+    checkpoint = result["metrics"]["checkpoint"]
+    # Phase 3.2: P5 now TRAINS an opponent model — a real checkpoint exists and
+    # the model is usable because it beat the honest uniform reference.
+    assert metrics["opponent_model_usable"] == 1.0
+    assert checkpoint is not None
+    assert (tmp_path / "stage5" / "stage5_adaptive.pt").exists()
+    assert metrics["opponent_sessions"] == 8.0
     assert metrics["opponent_regimes"] == 3.0
     assert metrics["oracle_gain"] >= 0.0
-    # The NLL is the uniform *reference*, not a trained model's calibration — the
-    # field is named to say so, and the old ece==0.0 fabrication is gone.
-    assert "uniform_reference_nll" in metrics
-    assert "opponent_ece" not in metrics
+    # A trained model's calibration is now measured (NLL beats uniform, ECE real).
+    assert metrics["opponent_nll"] < metrics["uniform_reference_nll"]
+    assert metrics["nll_gain_over_uniform"] > 0.0
+    assert 0.0 <= metrics["opponent_ece"] <= 1.0
+    # Phase 3.2b firewall: robust params provably unchanged, adaptive got gradient.
+    assert metrics["robust_param_delta_l1"] == 0.0
+    assert metrics["adaptive_grad_norm_last"] > 0.0
     assert (tmp_path / "stage5" / "adaptive" / "opponent_sessions.jsonl").exists()
     assert (tmp_path / "stage5" / "adaptive" / "adaptive_gate_report.json").exists()
 

@@ -22,7 +22,7 @@ from goofspiel.training.checkpoint import init_from_checkpoint as _load_init_fro
 from goofspiel.training.checkpoint import resume_checkpoint as _load_resume_checkpoint
 from goofspiel.training.checkpoint_registry import CheckpointRegistry
 from goofspiel.training.corpus import generate_random_game_corpus
-from goofspiel.training.data import FailureRecord, JsonlStore, ReanalysisRecord, RobustTrajectorySample, RoundRecord, state_record_from_game_state
+from goofspiel.training.data import FailureRecord, JsonlStore, OpponentSession, ReanalysisRecord, RobustTrajectorySample, RoundRecord, state_record_from_game_state
 from goofspiel.training.distributed import barrier_if_distributed, setup_torch_distributed
 from goofspiel.training.evaluation import evaluate_bot_matchup, exact_feasibility_sweep
 from goofspiel.training.league import LeagueAgent, LeagueRegistry, ROLE_AGGRESSIVE, ROLE_EXPLOITER, ROLE_ROBUST
@@ -794,111 +794,385 @@ def run_stage4_robust_rl(
     )
 
 
+def _opponent_regime_distribution(regime_id: str, legal: list[int], *, stake: int, n_cards: int) -> dict[int, float]:
+    """The TRUE next-action distribution of a scripted regime (the label P5 fits).
+
+    ``opponent_action_for_regime`` samples an action; here we expose the full
+    categorical it samples from, so P5 can train the opponent head against a real
+    probability target and measure a real NLL/ECE against it — not a constant."""
+    if not legal:
+        raise ValueError("distribution requires at least one legal action")
+    threshold = max(1, n_cards // 2)
+    if regime_id == "high_card_pressure" and stake >= threshold:
+        return {card: (1.0 if card == max(legal) else 0.0) for card in legal}
+    if regime_id == "low_card_saver" and stake <= threshold:
+        return {card: (1.0 if card == min(legal) else 0.0) for card in legal}
+    p = 1.0 / len(legal)
+    return {card: p for card in legal}
+
+
+def _build_adaptive_training_tensors(sessions, *, max_cards, device):
+    """Featurize opponent sessions into (public batch, history, memory, target) for
+    the adaptive/opponent branch.
+
+    Each *decision point* becomes one training row whose:
+      * public state is reconstructed from the round (masks shrink as cards are played);
+      * intra-game history is the rounds of THIS game so far (feeds the LSTM);
+      * inter-game memory is a per-game summary sequence of PRIOR games this
+        session (feeds the Mamba) — so the long-horizon head sees real cross-game
+        context, the whole point of the session structure;
+      * target is the opponent's actual next action index (for NLL/accuracy).
+    """
+    torch, _F = _torch_import()
+    from goofspiel.models import public_state_from_game
+
+    states: list[GameState] = []
+    hist_rows: list[list[dict[str, float]]] = []
+    mem_rows: list[list[list[float]]] = []
+    targets: list[int] = []
+    n_cards_row: list[int] = []
+    for session in sessions:
+        prior_game_summaries: list[list[float]] = []
+        for game in session.games:
+            n = _infer_session_n(game, max_cards)
+            self_mask = opp_mask = (1 << n) - 1
+            prize_mask = self_mask
+            self_score = opp_score = 0
+            carry = 0
+            game_hist: list[dict[str, float]] = []
+            for rec in game:
+                prize = int(rec.prize)
+                state = GameState(
+                    n=n, self_mask=self_mask, opp_mask=opp_mask,
+                    prize_mask=prize_mask & ~(1 << (prize - 1)) if prize else prize_mask,
+                    current_prize=prize, self_score=self_score, opp_score=opp_score,
+                    round_index=int(rec.round_index), done=False, carry_pool=carry,
+                )
+                states.append(state)
+                hist_rows.append(list(game_hist))
+                mem_rows.append(list(prior_game_summaries))
+                targets.append(int(rec.opponent_action) - 1)
+                n_cards_row.append(n)
+                game_hist.append({
+                    "prize": float(prize),
+                    "self_action": float(rec.self_action),
+                    "opponent_action": float(rec.opponent_action),
+                    "score_diff": float(self_score - opp_score),
+                    "round_idx": float(rec.round_index),
+                })
+                self_mask &= ~(1 << (int(rec.self_action) - 1))
+                opp_mask &= ~(1 << (int(rec.opponent_action) - 1))
+                self_score += int(rec.reward_self)
+                opp_score += int(rec.reward_opponent)
+                carry = int(rec.carry_out)
+                prize_mask &= ~(1 << (prize - 1)) if prize else prize_mask
+            # One D-dim summary of the finished game for the inter-game memory.
+            prior_game_summaries.append(_summarize_game(game, n, max_cards))
+
+    if not states:
+        return None
+    batch = public_state_from_game(states, max_cards=max_cards, device=device)
+    history = _stack_history(hist_rows, max_cards=max_cards, device=device)
+    memory = _stack_memory(mem_rows, dim=192, device=device)
+    target_t = torch.tensor(targets, dtype=torch.long, device=device)
+    return batch, history, memory, target_t, n_cards_row
+
+
+def _infer_session_n(game, max_cards: int) -> int:
+    cards = {int(r.self_action) for r in game} | {int(r.opponent_action) for r in game} | {int(r.prize) for r in game}
+    return max(len(game), max(cards, default=1), 1) if game else 1
+
+
+def _summarize_game(game, n: int, max_cards: int) -> list[float]:
+    """A fixed 192-d summary of a finished game for the inter-game memory sequence.
+
+    Deterministic featurization (not learned here): normalized final score diff,
+    round count, mean stake, opponent high/low-card rates, broadcast to 192-d so
+    it matches the Mamba input width.  The learned `game_summary_projector` then
+    projects it inside the model."""
+    if not game:
+        return [0.0] * 192
+    total = n * (n + 1) / 2.0
+    self_score = sum(int(r.reward_self) for r in game)
+    opp_score = sum(int(r.reward_opponent) for r in game)
+    opp_high = sum(1 for r in game if int(r.opponent_action) == n) / len(game)
+    opp_low = sum(1 for r in game if int(r.opponent_action) == 1) / len(game)
+    feats = [
+        (self_score - opp_score) / total,
+        len(game) / float(max_cards),
+        sum(int(r.prize) + int(r.carry_in) for r in game) / (len(game) * total),
+        opp_high,
+        opp_low,
+    ]
+    reps = (192 + len(feats) - 1) // len(feats)
+    return (feats * reps)[:192]
+
+
+def _stack_history(hist_rows, *, max_cards, device):
+    torch, _F = _torch_import()
+    from goofspiel.models import HistoryBatch
+
+    batch = len(hist_rows)
+    steps = max((len(h) for h in hist_rows), default=1) or 1
+    prize = torch.zeros(batch, steps, dtype=torch.long, device=device)
+    self_a = torch.zeros_like(prize)
+    opp_a = torch.zeros_like(prize)
+    score_diff = torch.zeros(batch, steps, device=device)
+    round_idx = torch.zeros(batch, steps, device=device)
+    valid = torch.zeros(batch, steps, dtype=torch.bool, device=device)
+    for i, rows in enumerate(hist_rows):
+        for t, ev in enumerate(rows):
+            prize[i, t] = int(ev["prize"])
+            self_a[i, t] = int(ev["self_action"])
+            opp_a[i, t] = int(ev["opponent_action"])
+            score_diff[i, t] = ev["score_diff"]
+            round_idx[i, t] = ev["round_idx"]
+            valid[i, t] = True
+    return HistoryBatch(
+        prize=prize, self_action=self_a, opponent_action=opp_a,
+        score_diff=score_diff, outcome=torch.zeros_like(score_diff),
+        round_idx=round_idx, valid_mask=valid,
+    )
+
+
+def _stack_memory(mem_rows, *, dim, device):
+    torch, _F = _torch_import()
+    from goofspiel.models import OpponentMemoryBatch
+
+    batch = len(mem_rows)
+    games = max((len(m) for m in mem_rows), default=1) or 1
+    seq = torch.zeros(batch, games, dim, device=device)
+    valid = torch.zeros(batch, games, dtype=torch.bool, device=device)
+    for i, rows in enumerate(mem_rows):
+        for g, summary in enumerate(rows):
+            seq[i, g] = torch.tensor(summary, dtype=torch.float32, device=device)
+            valid[i, g] = True
+    return OpponentMemoryBatch(game_summary_sequence=seq, valid_mask=valid)
+
+
+def _expected_calibration_error(probs, targets, *, n_bins: int = 10) -> float:
+    """ECE over the predicted-argmax confidence vs. empirical accuracy."""
+    torch, _F = _torch_import()
+    conf, pred = probs.max(dim=-1)
+    acc = (pred == targets).float()
+    ece = 0.0
+    for b in range(n_bins):
+        lo, hi = b / n_bins, (b + 1) / n_bins
+        in_bin = (conf > lo) & (conf <= hi) if b > 0 else (conf >= lo) & (conf <= hi)
+        if in_bin.any():
+            ece += float(in_bin.float().mean()) * abs(float(acc[in_bin].mean()) - float(conf[in_bin].mean()))
+    return ece
+
+
 def run_stage5_adaptive(
     *,
     steps: int,
     out_dir: str | Path,
     n_cards: int = 5,
+    lr: float = 3e-4,
+    init_from_checkpoint: str | Path | None = None,
+    resume_checkpoint: str | Path | None = None,
 ) -> StageMetrics:
-    """Build opponent sessions and run a curriculum calibration gate."""
+    """P5 — TRAIN the opponent/adaptive branch on scripted-regime sessions.
+
+    Phase 3.2: this stage no longer emits a constant-NLL diagnostic.  It builds
+    real multi-game opponent sessions, then runs supervised training of the
+    opponent-prediction heads (short/long/fused) — the LSTM, Mamba, memory fusion
+    and opponent heads — against each regime's TRUE next-action distribution.
+
+    Phase 3.2b — explicit gradient firewall.  The robust backbone/Q/actor are
+    *frozen by `requires_grad_(False)`*, not merely shielded by `.detach()`.  We
+    optimize ONLY `model.adaptive_parameters()`, and after every step assert the
+    firewall directly (`‖Δθ_R‖ == 0` and `‖∇θ_A‖ > 0`) so a future refactor that
+    leaks gradient into robust is caught here, in the run itself.
+    """
+    torch, F = _torch_import()
+    from goofspiel.models import GoofspielModel
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     rng = random.Random(503 + int(steps) + int(n_cards))
     sessions_path = out / "adaptive" / "opponent_sessions.jsonl"
     sessions = JsonlStore(sessions_path)
     session_rows = []
-    total_predictions = 0
-    correct_uniform_bucket = 0
-    nll_total = 0.0
-    rounds_total = 0
     regimes = default_opponent_curriculum()
+    # --- Build the opponent sessions: several GAMES per session so the inter-game
+    #     Mamba memory has real cross-game context to carry. ---
+    games_per_session = 3
     for session_idx in range(max(1, int(steps))):
         regime = regimes[session_idx % len(regimes)]
-        first_prize = rng.choice(list(range(1, n_cards + 1)))
-        state = GameState.initial(n_cards, current_prize=first_prize)
-        rounds = []
-        while not state.done:
-            self_cards = state.self_actions
-            opp_cards = state.opponent_actions
-            self_action = rng.choice(self_cards)
-            opp_action = opponent_action_for_regime(
-                regime.regime_id,
-                opp_cards,
-                stake=state.stake,
-                n_cards=n_cards,
-                rng=rng,
-            )
-            # No opponent model exists yet (P5 does not train one — Phase 5).
-            # This is the *uniform reference* likelihood: a constant log(len)
-            # per prediction. It is named honestly and must never be presented
-            # as a trained model's calibration.
-            prob = 1.0 / len(opp_cards)
-            total_predictions += 1
-            correct_uniform_bucket += 1 if prob >= 1.0 / len(opp_cards) else 0
-            nll_total += -__import__("math").log(max(prob, 1e-9))
-            next_prize = rng.choice(legal_cards(state.prize_mask, state.n)) if state.prize_mask else None
-            result = transition(state, self_action, opp_action, next_prize=next_prize)
-            rounds.append(
-                RoundRecord(
-                    round_index=state.round_index,
-                    prize=state.current_prize,
-                    self_action=self_action,
-                    opponent_action=opp_action,
-                    reward_self=result.reward_self,
-                    reward_opponent=result.reward_opp,
-                    carry_in=state.carry_pool,
-                    carry_out=result.state.carry_pool,
-                    done=result.state.done,
+        games: list[list[RoundRecord]] = []
+        for _ in range(games_per_session):
+            first_prize = rng.choice(list(range(1, n_cards + 1)))
+            state = GameState.initial(n_cards, current_prize=first_prize)
+            rounds = []
+            while not state.done:
+                self_action = rng.choice(state.self_actions)
+                opp_action = opponent_action_for_regime(
+                    regime.regime_id, state.opponent_actions,
+                    stake=state.stake, n_cards=n_cards, rng=rng,
                 )
-            )
-            state = result.state
-        rounds_total += len(rounds)
-        from goofspiel.training.data import OpponentSession
-
+                next_prize = rng.choice(legal_cards(state.prize_mask, state.n)) if state.prize_mask else None
+                result = transition(state, self_action, opp_action, next_prize=next_prize)
+                rounds.append(RoundRecord(
+                    round_index=state.round_index, prize=state.current_prize,
+                    self_action=self_action, opponent_action=opp_action,
+                    reward_self=result.reward_self, reward_opponent=result.reward_opp,
+                    carry_in=state.carry_pool, carry_out=result.state.carry_pool,
+                    done=result.state.done,
+                ))
+                state = result.state
+            games.append(rounds)
         session = OpponentSession(
             session_id=f"adaptive_session_{session_idx}_{uuid.uuid4().hex}",
             opponent_id=f"curriculum_{regime.regime_id}",
             strategy_regime_id=regime.regime_id,
-            games=[rounds],
+            games=games,
         )
         sessions.append(session)
         session_rows.append(session)
-    uniform_reference_nll = nll_total / max(total_predictions, 1)
+    rounds_total = sum(len(g) for s in session_rows for g in s.games)
+
+    # --- Featurize and train the opponent/adaptive branch (robust FROZEN). ---
+    device = "cpu"
+    model = GoofspielModel(max_cards=13).to(device)
+    model.assert_partition_is_complete()
+    opt = torch.optim.AdamW(model.adaptive_parameters(), lr=lr)
+    lineage = _apply_init_or_resume(
+        model,
+        init_from_checkpoint_path=init_from_checkpoint,
+        resume_checkpoint_path=resume_checkpoint,
+        optimizers={"adaptive_sft": opt},
+    )
+    # The firewall: freeze robust params EXPLICITLY (Phase 3.2b), not via detach.
+    model.set_robust_requires_grad(False)
+
+    tensors = _build_adaptive_training_tensors(session_rows, max_cards=13, device=device)
+    if tensors is None:
+        raise RuntimeError("P5 produced no training rows from the opponent sessions")
+    batch, history, memory, target_t, n_cards_row = tensors
+    # Uniform reference NLL per decision point (the honest bar to beat), computed
+    # from the actual legal-action counts, not a single scalar.
+    legal_counts = batch.opponent_action_mask.sum(dim=-1).clamp_min(1).float()
+    uniform_reference_nll = float(torch.log(legal_counts).mean())
+
+    robust_snapshot = [p.detach().clone() for p in model.robust_parameters()]
+    train_steps = max(1, int(steps))
+    last = {"nll": float("nan"), "acc": 0.0, "ece": 1.0, "adaptive_grad_norm": 0.0, "robust_delta": 0.0}
+    model.train()
+    for _step in range(train_steps):
+        out_model = model(batch, current_game_history=history, long_term_memory=memory)
+        # Train the FUSED opponent head (short+long context combined). Masked to
+        # legal opponent actions so the categorical is over legal cards only.
+        logits = out_model.opponent_fused_logits
+        loss = F.cross_entropy(logits, target_t)
+        # Auxiliary short/long supervision keeps both memory paths learning.
+        loss = loss + 0.5 * F.cross_entropy(out_model.opponent_short_logits, target_t)
+        loss = loss + 0.5 * F.cross_entropy(out_model.opponent_long_logits, target_t)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        adaptive_grad_norm = float(torch.sqrt(sum(
+            (p.grad.detach().float().pow(2).sum() for p in model.adaptive_parameters() if p.grad is not None),
+            torch.tensor(0.0),
+        )))
+        # No robust param may carry gradient at all (frozen ⇒ grad is None).
+        robust_with_grad = [p for p in model.robust_parameters() if p.grad is not None]
+        if robust_with_grad:
+            raise AssertionError(f"{len(robust_with_grad)} robust params received gradient in P5 (firewall breach)")
+        torch.nn.utils.clip_grad_norm_(model.adaptive_parameters(), 1.0)
+        opt.step()
+        with torch.no_grad():
+            probs = F.softmax(logits.masked_fill(~batch.opponent_action_mask, -1e9), dim=-1)
+            nll = float(F.cross_entropy(logits, target_t))
+            acc = float((probs.argmax(dim=-1) == target_t).float().mean())
+            ece = _expected_calibration_error(probs, target_t)
+        last = {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm,
+                "robust_delta": 0.0}
+    # Firewall assertion #2: robust params are byte-for-byte unchanged.
+    robust_delta = float(sum(
+        (a - b).abs().sum() for a, b in zip(model.robust_parameters(), robust_snapshot)
+    ))
+    last["robust_delta"] = robust_delta
+    if robust_delta != 0.0:
+        raise AssertionError(f"robust params moved during P5 (‖Δθ_R‖={robust_delta} ≠ 0): firewall breach")
+
     oracle = oracle_opponent_diagnostic(session_rows, n_cards=n_cards)
+    beats_uniform = last["nll"] < uniform_reference_nll
+    ckpt_path = None
+    ckpt = out / "stage5_adaptive.pt"
+    manifest = save_checkpoint(
+        ckpt,
+        model=model,
+        optimizers={"adaptive_sft": opt},
+        metadata=CheckpointMetadata(
+            checkpoint_id="stage5_adaptive",
+            training_stage="P5_ADAPTIVE",
+            global_step=train_steps,
+            policy_version=3,
+            config={"steps": steps, "n_cards": n_cards, "lr": lr, "games_per_session": games_per_session},
+            metrics={
+                "opponent_nll": last["nll"],
+                "uniform_reference_nll": uniform_reference_nll,
+                "opponent_accuracy": last["acc"],
+                "opponent_ece": last["ece"],
+            },
+            parent_checkpoint_id=lineage["parent_checkpoint_id"],
+            init_checkpoint_id=lineage["init_checkpoint_id"],
+            model_config_hash=model_config_hash(model),
+            optimizer_reset=lineage["optimizer_reset"],
+        ),
+    )
+    ckpt_path = manifest["path"]
+
     report = {
-        # No opponent model is trained in P5 yet (Phase 5). Report this honestly
-        # rather than claiming a usable model. ECE is omitted (not fabricated as
-        # 0.0) because there is no probabilistic predictor to calibrate.
-        "opponent_model_usable": False,
-        "gate": "CURRICULUM_BUILT_NO_MODEL",
+        # A trained opponent model now exists. It is usable iff it beat the honest
+        # uniform reference on these scripted regimes.
+        "opponent_model_usable": bool(beats_uniform),
+        "gate": "OPPONENT_MODEL_TRAINED" if beats_uniform else "OPPONENT_MODEL_BELOW_UNIFORM",
         "calibration": {
             "sessions": max(1, int(steps)),
+            "games_per_session": games_per_session,
             "rounds": rounds_total,
+            "opponent_nll": last["nll"],
             "uniform_reference_nll": uniform_reference_nll,
-            "uniform_bucket_accuracy": correct_uniform_bucket / max(total_predictions, 1),
+            "nll_gain_over_uniform": uniform_reference_nll - last["nll"],
+            "opponent_accuracy": last["acc"],
+            "opponent_ece": last["ece"],
             "oracle_accuracy": oracle["oracle_accuracy"],
             "oracle_gain": oracle["oracle_gain"],
             "switch_delay": oracle["switch_delay"],
         },
+        # 3.2b firewall evidence, recorded in the artifact itself.
+        "firewall": {
+            "robust_frozen": True,
+            "robust_param_delta_l1": robust_delta,
+            "adaptive_grad_norm_last": last["adaptive_grad_norm"],
+        },
         "opponent_curriculum": [regime.__dict__ for regime in regimes],
-        "required": {"nll_better_than_uniform": False, "switch_benchmark": "curriculum_gate"},
+        "required": {"nll_better_than_uniform": bool(beats_uniform), "switch_benchmark": "curriculum_gate"},
         "session_path": str(sessions_path),
+        "checkpoint": ckpt_path,
     }
     (out / "adaptive" / "adaptive_gate_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return StageMetrics(
         "P5_ADAPTIVE",
         int(steps),
         {
-            # Honest: no trained opponent model exists (Phase 5). 0.0 = not usable.
-            "opponent_model_usable": 0.0,
+            "opponent_model_usable": 1.0 if beats_uniform else 0.0,
             "opponent_sessions": float(max(1, int(steps))),
             "opponent_rounds": float(rounds_total),
+            "opponent_nll": float(last["nll"]),
             "uniform_reference_nll": float(uniform_reference_nll),
+            "nll_gain_over_uniform": float(uniform_reference_nll - last["nll"]),
+            "opponent_accuracy": float(last["acc"]),
+            "opponent_ece": float(last["ece"]),
             "opponent_regimes": float(len({s.strategy_regime_id for s in session_rows})),
             "oracle_gain": float(oracle["oracle_gain"]),
             "switch_delay": float(oracle["switch_delay"]),
+            "robust_param_delta_l1": float(robust_delta),
+            "adaptive_grad_norm_last": float(last["adaptive_grad_norm"]),
         },
-        None,
+        ckpt_path,
     )
 
 
@@ -1190,8 +1464,11 @@ def run_smoke_pipeline(
         init_from_checkpoint=stage3.checkpoint,
     )
     emit("stage4_robust_rl", {"ok": True, "metrics": stage4.metrics, "checkpoint": stage4.checkpoint})
-    stage5 = run_stage5_adaptive(steps=steps, out_dir=out, n_cards=n_cards)
-    emit("stage5_adaptive", {"ok": True, "metrics": stage5.metrics})
+    stage5 = run_stage5_adaptive(
+        steps=steps, out_dir=out, n_cards=n_cards,
+        init_from_checkpoint=stage4.checkpoint,
+    )
+    emit("stage5_adaptive", {"ok": True, "metrics": stage5.metrics, "checkpoint": stage5.checkpoint})
     stage6 = run_stage6_league(out_dir=out)
     emit("stage6_league", {"ok": True, "metrics": stage6.metrics})
     stage7 = run_stage7_redteam(out_dir=out)

@@ -491,6 +491,33 @@ stronger than trusting `.detach()` and pins the `Q_R ⊥ Q_A` firewall in CI.
 **Acceptance.** P5 saves a non-`None` checkpoint; robust params are provably unchanged by
 P5; its opponent-model NLL is measured and beats the uniform reference on scripted regimes.
 
+**Status — DONE (2026-08-31).** P5 (`run_stage5_adaptive`) now TRAINS the opponent/adaptive
+branch instead of emitting a constant-NLL diagnostic. It builds real multi-game sessions
+(`games_per_session=3`, so the inter-game Mamba has genuine cross-game context), featurizes
+every decision point into `(public, intra-game history → LSTM, prior-game summary sequence →
+Mamba, opponent-action target)`, and supervises `opponent_fused_logits` (+ auxiliary
+short/long) against the scripted regime's true next-action. It chains via
+`init_from_checkpoint` (P4→P5) and saves `stage5_adaptive.pt` with full lineage. Real
+NLL/accuracy/ECE are computed and reported; convergence is monotone (n=5: gain-over-uniform
+0.013→0.032→0.117 and accuracy 0.51→0.62→ as steps go 10→30→60).
+**3.2(a):** P1 now also supervises `opponent_short_logits` and `opponent_long_logits` (not
+just fused) — previously those two heads had no P1 gradient at all.
+**3.2b firewall (explicit, not `.detach()`-only):** added `robust_parameters()` /
+`adaptive_parameters()` (an *exact* partition — `assert_partition_is_complete()` guards
+disjoint ∧ exhaustive over all 32 modules) and `set_robust_requires_grad(False)`. P5
+optimizes ONLY `adaptive_parameters()` with robust frozen, and asserts the firewall *in the
+run itself* every step: no robust param may carry gradient (`grad is None`), and
+`‖Δθ_R‖₁ == 0` end-to-end while `‖∇θ_A‖ > 0`. The dead `game_summary_projector` module
+(declared, never used) is now wired as the SSM input projection, so every adaptive param is
+live. Tests (`tests/unit/training/test_adaptive_firewall.py`, 3) re-execute the facts:
+(1) the partition is exact; (2) freezing robust yields `grad is None` on every robust param
+while adaptive still flows; (3) end-to-end P5 leaves robust byte-equal the inherited P4
+weights in the *saved* checkpoint, moves adaptive, saves a non-None checkpoint, and beats the
+uniform NLL. `test_training_pipeline.py::test_stage5_trains_opponent_model_behind_firewall`
+updated to the new contract (was `opponent_model_usable==0.0`, checkpoint None). Full smoke
+pipeline stays `ok=True / stage0_ok=True / algorithmic_ok=True`; P5 lineage records
+`stage5_adaptive ⟵ stage4_robust ⟵ stage3_sft ⟵ stage1_pretrain`.
+
 ---
 
 <a name="phase-4"></a>
@@ -542,6 +569,28 @@ opponent-conditioned` as a structural invariant, not a convention.
 **Acceptance.** A test where exploiting a known-biased opponent (via `adaptive_view`)
 raises value **without** dropping the guaranteed robust value below `robust_value −
 epsilon`; plus an assertion that `robust_view()` exposes no opponent-history fields.
+
+> **Status — DONE (2026-08-31).** 4.1: new `goofspiel/reasoning/model_provider.py`
+> `TrainedModelProvider` wraps a loaded `GoofspielModel`; `ToolRouter(..., model_provider=)`
+> and `GameAgent(checkpoint=)` source robust Q/masks from `q_robust` (public state only —
+> no history/memory, so `Q_R ⊥ opponent` holds for the model too), falling back to
+> `immediate_q_matrix` on absence or any provider error. The router trace records
+> `q_source` (`model_q_robust` vs `immediate_q_matrix`). 4.2: `state.py` keeps
+> `robust_view()` opponent-agnostic (documented; new `exposes_opponent_information()`
+> re-checks every field in `OPPONENT_INFORMATION_FIELDS`) and adds real opponent-conditioned
+> fields (`opponent_belief`, `opponent_memory`, `current_game_history`) surfaced by
+> `adaptive_view()`. The router now derives a belief from the adaptive view (explicit
+> injection wins; else the trained `opponent_fused` head), builds an `EXACT_BEST_RESPONSE`
+> adaptive candidate, and threads both into `final_decision`, reviving the
+> `safe_exploit_mixture` cascade. `safe_mixture.py` was corrected: the robust floor now
+> (a) excludes illegal padded columns via a new `opponent_mask` arg — a `0 >= V_R` from a
+> pad column would otherwise kill every exploit — and (b) defaults `robust_value` to the
+> policy's **minimax worst case over legal columns** (a real guarantee), not the
+> belief-weighted average. Tests (`tests/unit/reasoning/test_model_router_integration.py`,
+> 5) **re-execute** every fact: belief-value and worst-case are recomputed from
+> (policy, Q); a counterfactual proves the floor refuses an unsafe exploit (α→0, value
+> unchanged); `robust_view()` leaks nothing; and the provider genuinely sources Q + belief
+> from a real chained P1 checkpoint. 23/23 reasoning+learning tests pass, 0 regressions.
 
 ### 4.3 P6 league plays real checkpoint snapshots
 

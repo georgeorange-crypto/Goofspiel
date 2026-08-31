@@ -416,7 +416,18 @@ class GoofspielModel(nn.Module):
 
         rank_emb = self.rank_encoder(public_state.n_cards, n)
         lstm_state = self._encode_history(current_game_history, rank_emb, batch, public_state.device)
-        mamba_state = self.inter_game_mamba(long_term_memory, batch, public_state.device)
+        # Phase 3.2: project each per-game summary before the inter-game SSM.
+        # `game_summary_projector` was previously declared but never used — a dead
+        # adaptive module.  It is the natural input projection to the Mamba: the
+        # raw per-game summaries are learned-projected, then the selective scan
+        # carries state across games.  (Robust outputs never see this path.)
+        projected_memory = long_term_memory
+        if long_term_memory is not None:
+            projected_memory = OpponentMemoryBatch(
+                game_summary_sequence=self.game_summary_projector(long_term_memory.game_summary_sequence.float()),
+                valid_mask=long_term_memory.valid_mask,
+            )
+        mamba_state = self.inter_game_mamba(projected_memory, batch, public_state.device)
         opponent_embedding = self.memory_fusion(torch.cat([lstm_state, mamba_state, public.detach()], dim=-1))
 
         def opp_logits(head: nn.Module, memory: Tensor) -> Tensor:

@@ -141,12 +141,12 @@ measurable.
 | Overall smoke PASS hinges only on stage 0 | `stages.py:907` (`summary["ok"] = bool(stage0.ok)`) | PASS must also require the 0.1 harness to beat Random by a margin, or at minimum surface a separate `algorithmic_ok` field instead of implying end-to-end success. |
 | `opponent_model_usable=True`, `ece=0.0` are literals | `stages.py:624`, `:630`, `:645`, `:649` | Remove/compute. Until P5 trains a model (Phase 3.2), report `opponent_model_usable=False` honestly. |
 | P5 "NLL" is a constant `log(n)` | `stages.py:590` (`prob = 1.0/len(opp_cards)`) → `:593` → `:621` | Either compute a real predictor NLL or rename the field `uniform_reference_nll` so it cannot be read as a model metric. |
-| P7 regression booleans are literals | `stages.py:815-817`, `:839-840` | Do not write `True` until 4.4 actually re-runs the regression. Until then omit the field or write `null`. |
+| P7 regression booleans are literals | `stages.py:815-817`, `:839-840` | **RESOLVED (4.4).** P7 now runs a real focused correction and writes MEASURED `original_attack_regression_passed` / `general_regression_passed` / `recurrence` from re-playing the attack states before/after; tests re-run the regression. |
 | Benchmark reference rows | `benchmark.py:132`, `:137`, `:166` (`"gate": "PASS_REFERENCE"`) and gate literals `:171-177` (`G1/G3/G4/G7 = True`, `G5/G6 = bool(rows)`) | Mark clearly as `REFERENCE_ROW_NOT_A_RESULT`; do not let them satisfy promotion. |
 | P3 four metrics all equal `exact_anchor_count`; `pretraining_anchors_retained=1.0` | `stages.py:203-207` | Collapse to one honest `strategic_sft_samples`; delete `pretraining_anchors_retained` until P1→P3 chaining exists (Phase 3.1). |
 | `exact_tool` stamps `NUMERICAL_EXACT` on the immediate matrix for non-terminal states | `goofspiel/reasoning/exact_tool.py:65` (real solver imported then `del solver` at `:39`) | For non-terminal states, stamp `Exactness.APPROXIMATE` (or run the real `GoofspielCarrySolver`). Do not claim exactness you did not compute. |
 | "Mamba" is a GRU | `goofspiel/models/goofspiel_model.py:62-87` (`SimpleMambaMemory` = `Conv1d` + `nn.GRU`) | Rename to `PlaceholderSequenceMemory` now (real Mamba is Phase 2.3). Do not report "Mamba implemented" under a passed-spec banner. |
-| 5 registry aliases → same P4 checkpoint | `stages.py:542-543` (`for kind in ("latest","best_robust","best_raw","best_search","best_generalization")`) | Stop aliasing until each dimension is actually evaluated (Phase 5). Register only `latest` for now. |
+| 5 registry aliases → same P4 checkpoint | `stages.py:542-543` (`for kind in ("latest","best_robust","best_raw","best_search","best_generalization")`) | **RESOLVED (Phase 5).** `run_axis_promotion_selection` registers `best_robust`/`best_search`/`best_generalization` from their own per-axis 0.1-harness evaluations (`selection.py`); aliases can resolve to different files and do (best_search→stage7_corrected vs best_robust→stage3_sft on the smoke run). |
 
 **Acceptance.** `grep` for the literals above returns zero matches in a "success"
 position. A fresh smoke run's summary can no longer report PASS on stage-0 alone.
@@ -634,6 +634,21 @@ improved checkpoint, **re-play** the attack states through the 0.1 harness befor
 and write the *measured* pass/fail. Rewrite the tests to re-run the regression, not read
 a field.
 
+> **Status — DONE (2026-09-01).** `run_stage7_redteam` now loads (or mints) a real
+> checkpoint, measures the attack-state regression BEFORE via `_attack_state_regression`
+> (re-plays each attack state through `robust_policy_fn` and records argmax card + teacher
+> NLL), runs a focused correction SFT (KL toward stored teacher policy + smooth_l1 on
+> `q_robust`, 40 steps), saves `stage7_corrected.pt` with lineage metadata, re-measures
+> AFTER, and writes MEASURED `original_attack_regression_passed` /
+> `general_regression_passed` / `recurrence` + before/after match-rate & NLL into
+> `focused_correction_report.json` and `StageMetrics`. Smoke pipeline threads the P4
+> checkpoint into P7. Tests rewritten: `test_stage7_writes_redteam_reanalysis` asserts the
+> pass/fail keys are present & valued and match-rate does not degrade;
+> `test_stage7_focused_correction_and_regression_report` **re-loads the before/after
+> checkpoints and re-plays the attack states**, reproducing the reported match-rate and
+> per-state argmax cards (re-execution, not field-reading). Empirically: match-rate
+> 0.0→1.0, teacher NLL 1.04→0.0001 on the 3 attack states.
+
 ---
 
 <a name="phase-5"></a>
@@ -651,6 +666,25 @@ be registered without a distinguishing evaluation.
 
 **Acceptance.** On a run where two checkpoints genuinely differ, the registry aliases can
 resolve to different files; every gate value traces to a computed metric.
+
+> **Status — DONE (2026-09-01).** New `goofspiel/training/selection.py` computes THREE
+> distinct axis metrics per candidate from the 0.1 harness — `best_robust` = argmax mean
+> score-diff vs Random at the primary N; `best_search` = argmin exact
+> `full_game_exploitability`; `best_generalization` = argmax worst-N score-diff — and
+> `select_axis_winners` resolves each alias by its own argmax/argmin. `run_axis_promotion_selection`
+> (`stages.py`) evaluates the run's genuinely-distinct checkpoints (P3/P4/P5/P7) and
+> registers `best_*` from their per-axis winners (no unconditional P4 alias). The benchmark
+> is now model-aware: `run_unified_benchmark(..., checkpoint=...)` makes E2/E6 the trained
+> policy's REAL play vs Random (labelled `source="trained_model_vs_random"`) instead of the
+> Heuristic-vs-Random reference, and `G2_exploitability` is a computed robustness verdict
+> about the checkpoint (None/unrun when no model is supplied — never a reference-derived
+> literal). Smoke pipeline threads the P4 checkpoint into the benchmark and all four
+> checkpoints into axis selection. Tests: `test_axis_selection.py` proves the aliases SPLIT
+> (best_robust≠best_search on hand-built divergent policies, re-running the winner logic
+> from recomputed metrics) and the smoke pipeline registers real file-backed distinct
+> aliases; `test_benchmark.py` re-plays E2 to reproduce its reported score and asserts the
+> G2 discipline. Empirically on the smoke run: best_robust/best_generalization→stage3_sft,
+> best_search→stage7_corrected (2 distinct files).
 
 ---
 

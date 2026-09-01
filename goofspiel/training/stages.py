@@ -1598,7 +1598,7 @@ def run_stage7_redteam(
     )
 
 
-def run_evaluation_suite(*, out_dir: str | Path, num_games: int = 16) -> dict[str, Any]:
+def run_evaluation_suite(*, out_dir: str | Path, num_games: int = 16, checkpoint: str | None = None) -> dict[str, Any]:
     from goofspiel.training.benchmark import EvaluationProfile, run_unified_benchmark, write_benchmark_report
 
     report_a = evaluate_bot_matchup(num_games=num_games)
@@ -1612,9 +1612,88 @@ def run_evaluation_suite(*, out_dir: str | Path, num_games: int = 16) -> dict[st
         ]
     }
     path.write_text(__import__("json").dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    benchmark = run_unified_benchmark(EvaluationProfile(name="QUICK", num_games=num_games, include_e7=False))
+    # Phase 5: the benchmark is model-aware — E2/E6 become the trained policy's
+    # REAL play vs Random when a checkpoint is supplied (never the Heuristic-vs-
+    # Random reference), and G2 becomes a real robustness verdict on it.
+    benchmark = run_unified_benchmark(
+        EvaluationProfile(name="QUICK", num_games=num_games, include_e7=False), checkpoint=checkpoint
+    )
     payload["benchmark_report"] = write_benchmark_report(benchmark, Path(out_dir) / "reports" / "quick")
     return payload
+
+
+def run_axis_promotion_selection(
+    *,
+    out_dir: str | Path,
+    candidates: dict[str, str],
+    primary_n: int = 5,
+    generalization_ns: tuple[int, ...] = (3, 5),
+    exploit_n: int = 4,
+    num_games: int = 24,
+    seed: int = 1,
+) -> dict[str, Any]:
+    """Phase 5 — register ``best_*`` aliases from THEIR OWN evaluations.
+
+    Each candidate checkpoint is re-played through the 0.1 harness on three
+    distinct axes (raw robust score, full-game exploitability, worst-N
+    generalization); ``best_robust`` / ``best_search`` / ``best_generalization``
+    are then the per-axis winners.  Because the axes optimise different
+    quantities, the winners can be *different files* — the alias is no longer an
+    unconditional copy of the P4 checkpoint.  ``latest`` still tracks the primary
+    (last) candidate.  Every metric written here is computed, never a literal.
+    """
+    from goofspiel.training.selection import select_checkpoints_by_axis
+
+    out = Path(out_dir)
+    existing = {cid: path for cid, path in candidates.items() if path and Path(path).exists()}
+    if not existing:
+        return {"selected": {}, "table": {}, "reason": "no_candidate_checkpoints"}
+
+    selection = select_checkpoints_by_axis(
+        existing,
+        primary_n=primary_n,
+        generalization_ns=generalization_ns,
+        exploit_n=exploit_n,
+        num_games=num_games,
+        seed=seed,
+    )
+
+    registry = CheckpointRegistry(out / "registry")
+    # `latest` = the primary (last-listed) candidate; the three best_* aliases are
+    # resolved by their own axis winner.  Only register an alias whose winning
+    # candidate has a real, distinguishing metric on that axis.
+    primary_id = list(existing.keys())[-1]
+    registry.register("latest", existing[primary_id], global_step=0, metrics={})
+    registered: dict[str, dict[str, Any]] = {}
+    for alias, winner_id in selection.by_alias.items():
+        metric_key = {
+            "best_robust": "robust_score",
+            "best_search": "search_exploitability",
+            "best_generalization": "generalization_worst",
+        }[alias]
+        metric_value = selection.table[winner_id].get(metric_key)
+        registry.register(
+            alias,
+            existing[winner_id],
+            global_step=0,
+            metrics={metric_key: float(metric_value) if metric_value is not None else float("nan")},
+        )
+        registered[alias] = {
+            "winner": winner_id,
+            "checkpoint": existing[winner_id],
+            metric_key: metric_value,
+        }
+
+    report = {
+        "selected": registered,
+        "table": selection.table,
+        "distinct_winner_count": selection.distinct_winner_count(),
+        "candidates": {cid: str(path) for cid, path in existing.items()},
+    }
+    report_path = out / "reports" / "axis_selection.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report
 
 
 def _smoke_algorithmic_check(
@@ -1712,10 +1791,34 @@ def run_smoke_pipeline(
         n_cards=n_cards,
     )
     emit("stage6_league", {"ok": True, "metrics": stage6.metrics})
-    stage7 = run_stage7_redteam(out_dir=out)
+    # Phase 4.4: P7 focuses a REAL correction fine-tune on the P4 robust backbone
+    # and MEASURES the attack-state regression before/after.
+    stage7 = run_stage7_redteam(out_dir=out, init_from_checkpoint=stage4.checkpoint, n_cards=n_cards)
     emit("stage7_redteam", {"ok": True, "metrics": stage7.metrics})
-    evaluation = run_evaluation_suite(out_dir=out / "evaluation", num_games=max(2, num_corpus_games))
+    evaluation = run_evaluation_suite(
+        out_dir=out / "evaluation", num_games=max(2, num_corpus_games), checkpoint=stage4.checkpoint
+    )
     emit("evaluate", {"ok": True, "metrics": evaluation})
+
+    # Phase 5: register best_* aliases from THEIR OWN per-axis evaluations over
+    # the genuinely-distinct checkpoints this run produced (P3 strategic SFT, P4
+    # robust backbone, P5 adaptive, P7 corrected). The three axes optimise
+    # different quantities, so the aliases can resolve to different files.
+    axis_selection = run_axis_promotion_selection(
+        out_dir=out,
+        candidates={
+            "stage3_sft": stage3.checkpoint,
+            "stage4_robust": stage4.checkpoint,
+            "stage5_adaptive": stage5.checkpoint,
+            "stage7_corrected": stage7.checkpoint,
+        },
+        primary_n=max(3, min(n_cards, 5)),
+        generalization_ns=(3, max(3, min(n_cards, 5))),
+        exploit_n=min(4, max(3, n_cards)),
+        num_games=max(4, num_corpus_games),
+        seed=seed,
+    )
+    emit("axis_promotion_selection", axis_selection)
     emit("system_metrics_end", collect_system_metrics())
 
     # Honest algorithmic gate (Phase 0.2): re-execute the Phase 0.1 evaluator on

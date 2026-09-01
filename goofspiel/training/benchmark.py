@@ -74,6 +74,38 @@ def _seeded_matchups(profile: EvaluationProfile, *, n_cards: int = 13) -> dict[s
         "mean_score_diff": float(mean(diffs)) if diffs else 0.0,
         "worst_seed_score_diff": float(min(diffs)) if diffs else 0.0,
         "num_seeds": float(len(diffs)),
+        "source": "heuristic_vs_random_reference",
+    }
+
+
+def _seeded_model_matchups(
+    checkpoint: str | Path, profile: EvaluationProfile, *, n_cards: int = 13
+) -> dict[str, float]:
+    """E2/E6 for a TRAINED checkpoint: play its robust policy vs Random through the
+    real env (0.1 harness), averaged over the profile's seeds. Every number is
+    computed play, not a Heuristic-vs-Random reference."""
+    from goofspiel.training.model_eval import (
+        load_model_from_checkpoint,
+        play_policy_vs_bot,
+        robust_policy_fn,
+    )
+
+    model, meta = load_model_from_checkpoint(checkpoint)
+    policy = robust_policy_fn(model, greedy=True)
+    diffs = []
+    for seed in profile.seeds:
+        diffs.append(
+            play_policy_vs_bot(policy, "random", n_cards=n_cards, num_games=profile.num_games, seed=seed)[
+                "mean_score_diff"
+            ]
+        )
+    return {
+        "mean_score_diff": float(mean(diffs)) if diffs else 0.0,
+        "worst_seed_score_diff": float(min(diffs)) if diffs else 0.0,
+        "num_seeds": float(len(diffs)),
+        "source": "trained_model_vs_random",
+        "checkpoint": str(checkpoint),
+        "checkpoint_id": str(meta.get("checkpoint_id", "")),
     }
 
 
@@ -112,8 +144,27 @@ def _search_compute_summary() -> dict[str, Any]:
     return {"rows": rows}
 
 
-def run_unified_benchmark(profile: EvaluationProfile | None = None) -> BenchmarkReport:
+def run_unified_benchmark(
+    profile: EvaluationProfile | None = None,
+    *,
+    checkpoint: str | Path | None = None,
+) -> BenchmarkReport:
     profile = profile or EvaluationProfile()
+    # When a trained checkpoint is supplied, E2/E6 are the model's REAL play vs
+    # Random (0.1 harness); otherwise they fall back to the Heuristic-vs-Random
+    # reference and are clearly labelled as such via each row's ``source``.
+    have_model = bool(checkpoint) and Path(checkpoint).exists()
+
+    def _robust_at(n: int) -> dict[str, float]:
+        if have_model:
+            try:
+                return _seeded_model_matchups(checkpoint, profile, n_cards=n)
+            except Exception as exc:  # pragma: no cover - surfaced honestly
+                ref = _seeded_matchups(profile, n_cards=n)
+                ref["source"] = f"reference_fallback_model_error:{type(exc).__name__}"
+                return ref
+        return _seeded_matchups(profile, n_cards=n)
+
     arenas: dict[str, dict[str, Any]] = {}
     try:
         e0_gap = _matrix_matching_pennies_gap()
@@ -126,7 +177,7 @@ def run_unified_benchmark(profile: EvaluationProfile | None = None) -> Benchmark
             "error": repr(exc),
         }
     arenas["E1_EXACT_SMALL_N"] = _exact_small_n_summary(5)
-    arenas["E2_N13_ROBUST"] = _seeded_matchups(profile, n_cards=13)
+    arenas["E2_N13_ROBUST"] = _robust_at(13)
     arenas["E3_OPPONENT_MODELING"] = {
         "rows": [
             {"benchmark": "uniform_reference", "nll": math.log(13), "brier": 12 / 13, "ece": 0.0, "switch_delay": 0.0, "gate": "REFERENCE_ROW_NOT_A_RESULT"}
@@ -157,7 +208,7 @@ def run_unified_benchmark(profile: EvaluationProfile | None = None) -> Benchmark
         }
     arenas["E6_GENERALIZATION"] = {
         "rows": [
-            {"n": n, "robust_score": _seeded_matchups(profile, n_cards=n)["mean_score_diff"], "exploitability": 0.0, "opp_nll": math.log(n)}
+            {"n": n, "robust_score": _robust_at(n)["mean_score_diff"], "exploitability": 0.0, "opp_nll": math.log(n)}
             for n in (3, 5, 9, 13)
         ]
     }
@@ -172,10 +223,28 @@ def run_unified_benchmark(profile: EvaluationProfile | None = None) -> Benchmark
     # an unrun gate. The reference-row arenas (E3/E4/E7) prove only that a row
     # exists — that is NOT a calibration/safety result, so those gates are None
     # until a real evaluator fills them (Phases 4-5).
+    # Gate discipline (Phase 0.2 / Phase 5): a gate is True only when a real check
+    # computed it on the checkpoint under test; a gate that no arena actually
+    # evaluates yet is None (unknown), never a literal True. `all(...)` treats None
+    # as falsy, so promotion cannot ride on an unrun gate. The reference-row arenas
+    # (E3/E4/E7) prove only that a row exists — not a calibration/safety result —
+    # so those gates stay None until a real evaluator fills them.
+    e2 = arenas["E2_N13_ROBUST"]
+    e2_is_model = e2.get("source") == "trained_model_vs_random"
+    # G2 is a robustness verdict ABOUT the trained checkpoint: it can pass only
+    # when E2 is real model play (not the Heuristic-vs-Random reference) AND the
+    # trained policy beats Random on the computed mean score-diff. With no model,
+    # G2 is unrun (None), never a literal derived from a reference row.
+    if e2_is_model and not math.isnan(e2["mean_score_diff"]):
+        g2 = bool(e2["mean_score_diff"] > 0.0)
+    elif e2_is_model:
+        g2 = False
+    else:
+        g2 = None
     hard_gates = {
         "G0_integrity": bool(arenas["E0_MATHEMATICAL_CORRECTNESS"]["passed"]),
         "G1_exact_regression": None,
-        "G2_exploitability": not math.isnan(arenas["E2_N13_ROBUST"]["mean_score_diff"]),
+        "G2_exploitability": g2,
         "G3_historical": None,
         "G4_regression_suite": None,
         "G5_opponent_calibration": None,

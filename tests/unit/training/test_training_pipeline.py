@@ -148,12 +148,18 @@ def test_stage7_writes_redteam_reanalysis(tmp_path: Path):
     assert metrics["corrections"] == 3.0
     assert metrics["teacher_relabels"] == 3.0
     assert metrics["focused_correction_steps"] == 3.0
-    # Phase 0.2 honesty: no regression suite runs in P7 yet (Phase 4.4), so the
-    # pass/fail metric keys must be absent rather than fabricated as 1.0.
-    assert "original_attack_regression_passed" not in metrics
-    assert "general_regression_passed" not in metrics
+    # Phase 4.4: a real focused correction now runs, so the regression pass/fail
+    # metrics are MEASURED (0.0/1.0), no longer absent. They must be present and
+    # valued, and the correction must not degrade the attack match-rate.
+    assert metrics["original_attack_regression_passed"] in (0.0, 1.0)
+    assert metrics["general_regression_passed"] in (0.0, 1.0)
+    assert metrics["attack_match_rate_after"] >= metrics["attack_match_rate_before"]
+    # A focused correction that trains toward the teacher action must not raise
+    # the teacher-action NLL (it should fall or hold).
+    assert metrics["mean_teacher_nll_after"] <= metrics["mean_teacher_nll_before"] + 1e-6
     assert (tmp_path / "stage7" / "redteam" / "redteam_report.json").exists()
     assert (tmp_path / "stage7" / "redteam" / "focused_correction_report.json").exists()
+    assert (tmp_path / "stage7" / "redteam" / "stage7_corrected.pt").exists()
 
 
 # ================================================================
@@ -384,12 +390,29 @@ def test_stage6_league_plays_real_distinct_checkpoints(tmp_path: Path):
 # P7 red-team: focused correction + regression reports are real artifacts
 # ================================================================
 def test_stage7_focused_correction_and_regression_report(tmp_path: Path):
-    """focused_correction_report.json must contain training_plan + regression block.
+    """Phase 4.4: focused_correction_report.json carries a MEASURED regression,
+    and this test RE-EXECUTES it rather than trusting the reported fields.
 
-    This pins P7's 'focused correction training' and 'original attack/general
-    regression' outputs are real artifacts (not just metric flags).
+    The regression the report claims (match-rate / teacher-action argmax before
+    and after the focused correction) is reproduced here by:
+      1. reconstructing the exact three attack states P7 corrects on;
+      2. loading the report's init (before) and corrected (after) checkpoints;
+      3. re-playing the robust policy on each attack state through the 0.1
+         harness (``robust_policy_fn``) and recomputing the argmax card;
+      4. asserting the recomputed match-rate reproduces the report AND that the
+         correction did not degrade it (after >= before).
+    This makes the pass/fail a re-run fact, not a JSON literal.
     """
+    try:
+        __import__("torch")
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"torch cannot be imported: {exc}")
     import json
+
+    from goofspiel.training.checkpoint import load_checkpoint
+    from goofspiel.training.model_eval import robust_policy_fn
+    from goofspiel.models import GoofspielModel
+
     result = TrainingCoordinator(
         TrainingRunConfig(artifact_dir=str(tmp_path / "stage7"), stage="stage7_redteam")
     ).run()
@@ -401,8 +424,46 @@ def test_stage7_focused_correction_and_regression_report(tmp_path: Path):
     assert tp["steps"] >= 1
     assert "source" in tp
     reg = report["regression"]
-    # Phase 0.2 honesty: no regression is actually executed in P7 yet (Phase 4.4).
-    # The report must carry explicit null (unrun), never a fabricated pass/recurrence.
-    assert reg["original_attack_regression_passed"] is None
-    assert reg["general_regression_passed"] is None
-    assert reg["recurrence"] is None
+    # Phase 4.4: the regression is now MEASURED, so the booleans are real, not null.
+    assert reg["original_attack_regression_passed"] in (True, False)
+    assert reg["general_regression_passed"] in (True, False)
+    assert reg["recurrence"] in (True, False)
+    assert reg["match_rate_after"] >= reg["match_rate_before"]
+
+    # ---- RE-EXECUTE the regression from the saved checkpoints -----------------
+    # The exact three attack states P7 corrects on (mirrors run_stage7_redteam).
+    attack_states = [
+        GameState.initial(3, current_prize=1),
+        GameState.initial(3, current_prize=2),
+        GameState(n=3, self_mask=0b011, opp_mask=0b110, prize_mask=0b100, current_prize=1, carry_pool=2, round_index=2),
+    ]
+
+    def _replay_match_rate(ckpt_path: str, per_state: list[dict]) -> tuple[float, list[int]]:
+        model = GoofspielModel(max_cards=13)
+        model.load_state_dict(load_checkpoint(ckpt_path)["model_state"])
+        model.eval()
+        fn = robust_policy_fn(model, greedy=False, temperature=1.0)
+        matched = 0
+        argmaxes = []
+        for entry, state in zip(per_state, attack_states):
+            dist = fn(state)
+            argmax_card = max(dist, key=lambda c: (dist.get(c, 0.0), -c))
+            argmaxes.append(argmax_card)
+            if argmax_card == entry["teacher_card"]:
+                matched += 1
+        return matched / len(attack_states), argmaxes
+
+    before_ckpt = tp["init_checkpoint"]
+    after_ckpt = tp["corrected_checkpoint"]
+    assert Path(after_ckpt).exists()
+    # Re-play the AFTER checkpoint and reproduce the report's match-rate + argmaxes.
+    after_rate, after_argmaxes = _replay_match_rate(after_ckpt, reg["after"]["per_state"])
+    assert after_rate == pytest.approx(reg["match_rate_after"]), "after match-rate is not reproducible replay"
+    for entry, argmax_card in zip(reg["after"]["per_state"], after_argmaxes):
+        assert entry["argmax_card"] == argmax_card, "reported after argmax card is not reproducible"
+    # Re-play the BEFORE checkpoint and reproduce the report's before match-rate.
+    if Path(before_ckpt).exists():
+        before_rate, _ = _replay_match_rate(before_ckpt, reg["before"]["per_state"])
+        assert before_rate == pytest.approx(reg["match_rate_before"]), "before match-rate is not reproducible replay"
+        # The correction genuinely did not make the attack states worse.
+        assert after_rate >= before_rate

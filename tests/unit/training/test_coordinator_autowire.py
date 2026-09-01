@@ -155,8 +155,23 @@ def test_missing_parent_checkpoint_raises_not_silent(tmp_path, monkeypatch):
             self, stage, init_from_checkpoint=init_from_checkpoint, produced=produced, strict=strict
         )
         if stage == "stage1_pretrain":
-            # Simulate a checkpoint-write failure: metrics carry no checkpoint.
+            # Simulate stage1 producing NO checkpoint.  This must remove the file
+            # from disk, not merely null the reported metric: run_full_sequence
+            # resolves produced[stage] by RE-EXECUTING THE FACT (is the checkpoint
+            # on disk?), not by trusting the metric field — because a θ-stage
+            # writes its checkpoint on rank0 ONLY, so on every other rank the
+            # metric is None while rank0's file is legitimately present on the
+            # shared disk (guaranteed by the stage's post-write barrier).  Nulling
+            # only the metric would fake the exact rank1 state and wrongly assert a
+            # raise on it.  A faithful "produced nothing" means "no checkpoint file
+            # anywhere" — matching this test's own intent ("the parent checkpoint
+            # is absent").
             out["metrics"]["checkpoint"] = None
+            from pathlib import Path
+
+            ckpt = Path(self.artifact_dir) / "checkpoints" / "stage1_pretrain.pt"
+            ckpt.unlink(missing_ok=True)
+            Path(str(ckpt) + ".sha256.json").unlink(missing_ok=True)
         return out
 
     monkeypatch.setattr(coord_mod.TrainingCoordinator, "_dispatch_stage", sabotaged)

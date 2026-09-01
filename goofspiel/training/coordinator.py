@@ -488,6 +488,21 @@ class TrainingCoordinator:
             metrics = result.get("metrics")
             if isinstance(metrics, dict):
                 checkpoint = metrics.get("checkpoint")
+            # A θ-producing stage writes its checkpoint on RANK0 ONLY, so on every
+            # other rank `metrics["checkpoint"]` is None even though the file now
+            # exists on the shared disk (guaranteed: each such stage ends with a
+            # post-write `barrier_if_distributed()`).  `produced[stage]` must mean
+            # "did THIS RUN produce it" — true on all ranks — not "did MY rank
+            # write it"; otherwise the θ-inheritance check below raises on rank1+
+            # with "<parent> produced no checkpoint" while rank0 sails through.
+            # Fall back to the on-disk convention path (the same resolution the
+            # downstream strict stages already use) so the map is rank-symmetric.
+            if checkpoint is None:
+                relpath = _THETA_CHECKPOINT_RELPATH.get(stage)
+                if relpath is not None:
+                    candidate = self.artifact_dir / relpath
+                    if candidate.exists():
+                        checkpoint = str(candidate)
             produced[stage] = checkpoint
 
             logger.stage_end(

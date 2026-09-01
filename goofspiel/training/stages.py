@@ -981,7 +981,6 @@ def run_stage4_robust_rl(
         bootstrapped_returns = 0.8 * returns_t + 0.2 * target_out.q_robust[idx, action_self_t, action_opp_t].detach()
         q_loss = F.smooth_l1_loss(chosen_q, bootstrapped_returns, beta=0.1)
         centered_logits = legal_logits(out.robust_policy_logits, batch.self_action_mask)
-        masked_logits = out.robust_policy_logits.masked_fill(~batch.self_action_mask, -1e9)
         policy = F.softmax(centered_logits, dim=-1)
         log_policy = F.log_softmax(centered_logits, dim=-1)
         entropy = -(policy * log_policy).sum(dim=-1).mean()

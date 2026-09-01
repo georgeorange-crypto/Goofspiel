@@ -27,16 +27,6 @@ class TrajectoryReplayBuffer:
             self.items = self.items[-self.max_size:]
         self.store.extend(samples)
 
-    def extend_in_memory(self, samples: list[RobustTrajectorySample]) -> None:
-        """Extend the in-memory buffer without touching disk.
-
-        Used for distributed training where each rank contributes local rollouts
-        but only one rank should own the write-on-disk side effect.
-        """
-        self.items.extend(samples)
-        if len(self.items) > self.max_size:
-            self.items = self.items[-self.max_size:]
-
     def sample(self, k: int, rng: random.Random | None = None) -> list[RobustTrajectorySample]:
         if not self.items:
             return []

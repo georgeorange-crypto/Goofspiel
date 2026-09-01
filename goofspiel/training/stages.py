@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import random
@@ -27,7 +28,15 @@ from goofspiel.training.checkpoint import resume_checkpoint as _load_resume_chec
 from goofspiel.training.checkpoint_registry import CheckpointRegistry
 from goofspiel.training.corpus import generate_random_game_corpus
 from goofspiel.training.data import FailureRecord, JsonlStore, OpponentSession, ReanalysisRecord, RobustTrajectorySample, RoundRecord, state_record_from_game_state
-from goofspiel.training.distributed import barrier_if_distributed, setup_torch_distributed
+from goofspiel.training.distributed import (
+    all_gather_objects,
+    barrier_if_distributed,
+    broadcast_object,
+    current_runtime,
+    derive_rank_seed,
+    seed_everything,
+    setup_torch_distributed,
+)
 from goofspiel.training.evaluation import evaluate_bot_matchup, exact_feasibility_sweep
 from goofspiel.training.league import LeagueAgent, LeagueRegistry, ROLE_AGGRESSIVE, ROLE_EXPLOITER, ROLE_ROBUST
 from goofspiel.training.curriculum import ProgressiveCurriculum
@@ -134,7 +143,7 @@ def _apply_init_or_resume(
 ) -> dict[str, Any]:
     """Apply the two DISTINCT checkpoint interfaces to a freshly-built model.
 
-    ``init_from_checkpoint_path`` is a **stage transition** (P1→P3→P4): copy θ
+    ``init_from_checkpoint_path`` is a **stage transition** (P1->P3->P4): copy theta
     only, keep the fresh optimizer / step-0.  ``resume_checkpoint_path`` is a
     **crash resume**: restore the full training state.  They are mutually
     exclusive; conflating them is the bug 3.1 exists to prevent.  Returns a
@@ -143,7 +152,7 @@ def _apply_init_or_resume(
     if init_from_checkpoint_path and resume_checkpoint_path:
         raise ValueError(
             "init_from_checkpoint and resume_checkpoint are mutually exclusive: "
-            "'inherit θ across a stage boundary' and 'resume a crashed run' are "
+            "'inherit theta across a stage boundary' and 'resume a crashed run' are "
             "different operations and must not be conflated."
         )
     lineage: dict[str, Any] = {
@@ -159,7 +168,7 @@ def _apply_init_or_resume(
         lineage["init_checkpoint_id"] = prov["init_checkpoint_id"]
         lineage["parent_checkpoint_id"] = prov["init_checkpoint_id"]
         lineage["init_checkpoint_sha256"] = prov["init_checkpoint_sha256"]
-        # The parent FILE's content hash at the moment we inherited from it — the
+        # The parent FILE's content hash at the moment we inherited from it: the
         # single fact a lineage-consistency check needs to confirm the child was
         # built on THIS parent's bytes, not a same-named file that later changed.
         lineage["parent_checkpoint_sha256"] = prov["init_checkpoint_sha256"]
@@ -184,6 +193,7 @@ def run_stage1_pretrain(
     device: str = "cpu",
     n_cards: int = 13,
     lr: float = 3e-4,
+    seed: int = 1,
     corpus_path: str | Path | None = None,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
@@ -192,13 +202,14 @@ def run_stage1_pretrain(
     """P1 pretraining over swap, transition, joint-outcome, and opponent tasks.
 
     When ``corpus_path`` points at a ``game_corpus.jsonl`` (written by
-    ``build_corpus``), P1 pretrains over the states actually recorded there —
+    ``build_corpus``), P1 pretrains over the states actually recorded there,
     so the corpus is a LIVE producer feeding P1, not a dead artifact.  When it
     is absent, P1 falls back to on-the-fly ``sample_reachable_states``.
     """
     torch, F = _torch_import()
     from goofspiel.models import GoofspielModel, public_state_from_game
 
+    seed_everything(int(seed))
     runtime, device = setup_torch_distributed(device)
     model = GoofspielModel(max_cards=13).to(device)
     if runtime.is_distributed:
@@ -209,7 +220,7 @@ def run_stage1_pretrain(
         # once it is enabled.  static_graph=True is the primitive built for this:
         # it traces the autograd graph on the first iteration and reuses it, which
         # also transparently handles the multi-branch model's idle params (the
-        # per-stage loss is fixed, so the used-param set is stable across steps —
+        # per-stage loss is fixed, so the used-param set is stable across steps,
         # static_graph's precondition).  Required for correctness, not a perf knob.
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -253,10 +264,10 @@ def run_stage1_pretrain(
         opp_targets = torch.tensor([target.future_opponent_action - 1 for target in p1_targets], dtype=torch.long, device=device)
         opp_loss = F.cross_entropy(out.opponent_fused_logits, opp_targets)
         # Phase 3.2(a): give the SHORT- and LONG-horizon opponent heads their own
-        # supervised signal too — previously only the fused head was trained in P1,
+        # supervised signal too; previously only the fused head was trained in P1,
         # leaving opp_short/opp_long with no P1 gradient at all.  With no history /
         # memory fed here the LSTM/Mamba states are zero, so in P1 all three heads
-        # learn the same public-state → opponent-action map; the short/long
+        # learn the same public-state -> opponent-action map; the short/long
         # DIVERGENCE is what P5 induces once real intra-/inter-game context flows.
         opp_short_loss = F.cross_entropy(out.opponent_short_logits, opp_targets)
         opp_long_loss = F.cross_entropy(out.opponent_long_logits, opp_targets)
@@ -315,7 +326,7 @@ def run_stage1_pretrain(
                 training_stage="P1_PRETRAIN",
                 global_step=int(steps),
                 policy_version=0,
-                config={"steps": steps, "batch_size": batch_size, "n_cards": n_cards, "lr": lr, "world_size": runtime.world_size},
+                config={"steps": steps, "batch_size": batch_size, "n_cards": n_cards, "lr": lr, "seed": seed, "world_size": runtime.world_size},
                 metrics=metrics or {"loss_last": 0.0},
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
@@ -371,7 +382,7 @@ def _load_corpus_states(path: Path) -> list[GameState]:
     This is the seam that makes ``build_corpus`` a live producer instead of a
     dead artifact: P1 pretrains over the states actually recorded in
     ``game_corpus.jsonl`` when it exists.  Terminal states and states with no
-    legal self/opponent actions are skipped — P1's targets need a playable
+    legal self/opponent actions are skipped; P1's targets need a playable
     ``(self_action, opponent_action)`` pair.
     """
     if not path.exists():
@@ -397,6 +408,7 @@ def run_stage3_sft(
     device: str = "cpu",
     n_cards: int = 5,
     lr: float = 2e-4,
+    seed: int = 1,
     teacher_dataset_path: str | Path | None = None,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
@@ -405,14 +417,14 @@ def run_stage3_sft(
     """P3 Robust Strategic SFT that CONSUMES the multi-source teacher dataset.
 
     Phase 2.2b: P3 now loads ``teacher_dataset.jsonl`` (written by P2) and trains
-    the robust policy toward the *stored* teacher policies — so its loss depends
+    the robust policy toward the *stored* teacher policies, so its loss depends
     on the file's content and its four source counts (CFR/SEARCH/EXACT/PSEUDO)
     measure four genuinely different computations, not one aliased number.  When
     the dataset is absent (e.g. a stage run in isolation) it falls back to
     solving reachable states on the fly, and the source counts are reported as
     ``fallback``.
 
-    Phase 3.1: ``init_from_checkpoint`` inherits P1's θ (fresh optimizer);
+    Phase 3.1: ``init_from_checkpoint`` inherits P1's theta (fresh optimizer);
     ``resume_checkpoint`` restores a crashed P3 run in full.  The two are never
     conflated.
     """
@@ -421,13 +433,14 @@ def run_stage3_sft(
     from goofspiel.models import GoofspielModel, public_state_from_game
     from goofspiel.training.teacher_dataset import ROBUST_TEACHER_SOURCES
 
+    seed_everything(int(seed))
     runtime, device = setup_torch_distributed(device)
     model = GoofspielModel(max_cards=13).to(device)
     if runtime.is_distributed:
         # GoofspielModel.forward ALWAYS computes and returns every head (robust +
         # opponent + adaptive); stage3's loss consumes only the robust outputs.
         # find_unused_parameters keys off what forward RETURNS, not what the loss
-        # uses — so it marks the opponent/adaptive params "used" (they are
+        # uses, so it marks the opponent/adaptive params "used" (they are
         # reachable from the returned logits), then aborts when they receive no
         # grad ("...not all forward outputs participate in computing loss").
         # static_graph=True instead learns the true gradient-receiving set from
@@ -530,10 +543,10 @@ def run_stage3_sft(
     metrics = {
         "loss_last": last_loss,
         # Four DISTINCT robust-only teacher-source counts, consumed from the P2
-        # dataset — no longer four aliases of one number (Phase 2.2b). Each source
+        # dataset: no longer four aliases of one number (Phase 2.2b). Each source
         # is a different algorithm/search depth (CFR immediate, SEARCH depth-1,
         # EXACT full recursion, PSEUDO confident self-labels); none uses opponent
-        # behaviour (that is P5's job, preserving Q_R ⊥ Q_A).
+        # behaviour (that is P5's job, preserving robust/adaptive separation).
         "strategic_sft_samples": float(sum(source_counts.values())),
         "teacher_dataset_consumed": float(1.0 if dataset else 0.0),
     }
@@ -554,7 +567,7 @@ def run_stage3_sft(
                 training_stage="P3_STRATEGIC_SFT",
                 global_step=int(steps),
                 policy_version=1,
-                config={"steps": steps, "batch_size": batch_size, "n_cards": n_cards, "lr": lr, "world_size": runtime.world_size},
+                config={"steps": steps, "batch_size": batch_size, "n_cards": n_cards, "lr": lr, "seed": seed, "world_size": runtime.world_size},
                 metrics=metrics,
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
@@ -593,7 +606,7 @@ def run_stage2_semi_supervised(
     Phase 2.2b: instead of a single confidence-filtered ensemble label, P2 now
     labels reachable states with FOUR genuinely distinct robust-only sources
     (CFR / SEARCH / EXACT / PSEUDO) that differ by algorithm and search depth,
-    writing them all to ``teacher_dataset.jsonl`` — the file P3 actually trains
+    writing them all to ``teacher_dataset.jsonl``, the file P3 actually trains
     on.  None of the sources uses opponent behaviour (that stays in P5).
     """
     from goofspiel.training.teacher_dataset import ROBUST_TEACHER_SOURCES, build_teacher_dataset
@@ -634,7 +647,14 @@ def _uniform_policy(cards: list[int], max_cards: int) -> list[float]:
     return policy
 
 
-def _select_model_action(model: Any, state: GameState, *, device: str, temperature: float = 1.0) -> tuple[int, list[float], float]:
+def _select_model_action(
+    model: Any,
+    state: GameState,
+    *,
+    device: str,
+    temperature: float = 1.0,
+    rng: random.Random | None = None,
+) -> tuple[int, list[float], float]:
     torch, F = _torch_import()
     from goofspiel.models import public_state_from_game
 
@@ -643,17 +663,72 @@ def _select_model_action(model: Any, state: GameState, *, device: str, temperatu
         logits = model(batch).robust_policy_logits[0]
         logits = logits / max(float(temperature), 1e-6)
         probs = F.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs=probs)
-        action_idx = int(dist.sample().item())
-        prob = float(probs[action_idx].detach().cpu())
-    action = action_idx + 1
-    if action not in state.self_actions:
-        action = random.choice(state.self_actions)
-        prob = 1.0 / len(state.self_actions)
-    policy = [0.0] * 13
-    for i, value in enumerate(probs.detach().cpu().tolist()[:13]):
-        policy[i] = float(value)
+        policy = [0.0] * 13
+        probs_cpu = probs.detach().cpu().tolist()[:13]
+        for i, value in enumerate(probs_cpu):
+            policy[i] = float(value)
+        if rng is None:
+            dist = torch.distributions.Categorical(probs=probs)
+            action_idx = int(dist.sample().item())
+            prob = float(probs[action_idx].detach().cpu())
+            action = action_idx + 1
+            if action not in state.self_actions:
+                action = random.choice(state.self_actions)
+                prob = 1.0 / len(state.self_actions)
+        else:
+            action = _sample_from_policy(policy, state.self_actions, rng)
+            prob = float(policy[action - 1]) if action > 0 else 0.0
     return action, policy, prob
+
+
+def _trajectory_sample_id(*, stage: str, rank: int, step: int, game_index: int, seed: int, n_cards: int) -> str:
+    return f"{stage}:r{rank}:s{step}:g{game_index}:n{n_cards}:seed{seed}"
+
+
+def _trajectory_hash(sample: RobustTrajectorySample) -> str:
+    payload = {
+        "n": sample.n,
+        "final_score_diff": sample.final_score_diff,
+        "states": [state.__dict__ for state in sample.states],
+        "rounds": [round_record.__dict__ for round_record in sample.rounds],
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _stable_trajectory_prefix(
+    trajectories: list[RobustTrajectorySample],
+    k: int,
+) -> list[RobustTrajectorySample]:
+    """Select a deterministic content-hash prefix from gathered trajectories.
+
+    Stage4 defines ``batch_size`` as the learner/global training batch.  Under
+    DDP every rank may collect fresh rollouts, but the optimizer must consume
+    one shared global batch.  When replay is empty this helper avoids rank-order
+    bias by selecting the first ``k`` trajectories after stable content-hash
+    ordering, and then that batch is broadcast to all ranks.
+    """
+    if k <= 0:
+        return []
+    return sorted(trajectories, key=lambda sample: (_trajectory_hash(sample), sample.sample_id))[:k]
+
+
+def _rank_shard_range(total: int, rank: int, world_size: int) -> tuple[int, int]:
+    """Return this rank's contiguous shard of a global item count."""
+    total = max(0, int(total))
+    world_size = max(1, int(world_size))
+    rank = int(rank)
+    base, extra = divmod(total, world_size)
+    count = base + (1 if rank < extra else 0)
+    start = rank * base + min(rank, extra)
+    return start, count
+
+
+def _flatten_trajectory_lists(batches: list[list[RobustTrajectorySample]]) -> list[RobustTrajectorySample]:
+    flattened: list[RobustTrajectorySample] = []
+    for batch in batches:
+        flattened.extend(batch)
+    return flattened
 
 
 def _rollout_selfplay_game(
@@ -664,6 +739,7 @@ def _rollout_selfplay_game(
     device: str,
     model_version: str,
     game_index: int,
+    sample_id: str,
 ) -> RobustTrajectorySample:
     first_prize = rng.choice(list(range(1, n_cards + 1)))
     state = GameState.initial(n_cards, current_prize=first_prize)
@@ -675,9 +751,9 @@ def _rollout_selfplay_game(
     opp_probs = []
     while not state.done:
         states.append(state_record_from_game_state(state))
-        self_action, self_policy, self_prob = _select_model_action(model, state, device=device)
+        self_action, self_policy, self_prob = _select_model_action(model, state, device=device, rng=rng)
         opp_view = _mirrored_state(state)
-        opp_action, opp_policy, opp_prob = _select_model_action(model, opp_view, device=device)
+        opp_action, opp_policy, opp_prob = _select_model_action(model, opp_view, device=device, rng=rng)
         next_prize = rng.choice(legal_cards(state.prize_mask, state.n)) if state.prize_mask else None
         result = transition(state, self_action, opp_action, next_prize=next_prize)
         rounds.append(
@@ -699,7 +775,7 @@ def _rollout_selfplay_game(
         opp_probs.append(opp_prob)
         state = result.state
     return RobustTrajectorySample(
-        sample_id=f"selfplay_{game_index}_{uuid.uuid4().hex}",
+        sample_id=sample_id,
         states=states,
         rounds=rounds,
         behavior_policy_self=self_policies,
@@ -750,27 +826,33 @@ def run_stage4_robust_rl(
     device: str = "cpu",
     n_cards: int = 5,
     lr: float = 1e-4,
+    seed: int = 1,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
     logger: "TrainingLogger | None" = None,
 ) -> StageMetrics:
     """Self-play robust RL runner using trajectory replay + Nash/NeuRD anchors.
 
-    Phase 3.1: ``init_from_checkpoint`` inherits P3's θ (θ-only, fresh optimizer;
+    Phase 3.1: ``init_from_checkpoint`` inherits P3's theta (theta-only, fresh optimizer;
     the target network is then seeded from the inherited weights).
     ``resume_checkpoint`` restores model + optimizer + target network in full.
     """
     torch, F = _torch_import()
-    from goofspiel.learning.game_theory.neurd import row_action_regret
+    from goofspiel.learning.game_theory.neurd import (
+        NEURD_LOGIT_THRESHOLD,
+        legal_logits,
+        neurd_actor_loss_from_regret,
+        row_action_regret,
+    )
     from goofspiel.learning.game_theory.regret_matching_plus import solve_batch
     from goofspiel.models import GoofspielModel, public_state_from_game
 
+    seed_everything(int(seed))
     runtime, device = setup_torch_distributed(device)
+    rank_seed = derive_rank_seed(int(seed), runtime.rank)
     model = GoofspielModel(max_cards=13).to(device)
     target_model = GoofspielModel(max_cards=13).to(device)
     opt_q = torch.optim.AdamW(model.parameters(), lr=lr)
-    # Load θ (init, θ-only) or restore full state (resume, incl. target_model)
-    # BEFORE seeding the target network, so an inherited P3 θ propagates into it.
     lineage = _apply_init_or_resume(
         model,
         init_from_checkpoint_path=init_from_checkpoint,
@@ -779,30 +861,35 @@ def run_stage4_robust_rl(
         target_model=target_model,
     )
     if not resume_checkpoint:
-        # Fresh or θ-inherited: the target net tracks the (possibly inherited)
-        # online weights.  On resume the target was already restored from `extra`.
         target_model.load_state_dict(getattr(model, "module", model).state_dict())
     target_model.eval()
     if runtime.is_distributed:
-        # See stage1/stage3: forward always returns every head, but the robust-RL
-        # loss uses only the robust outputs, leaving the opponent/adaptive branch
-        # idle.  find_unused_parameters marks those params used (reachable from the
-        # returned logits) then aborts when they get no grad; static_graph=True
-        # learns the real gradient set from backward 0 and reuses it.  The loss is
-        # fixed step-to-step (only the sampled data / curriculum n changes, not the
-        # graph topology of the trainable model), so the used-param set is static.
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
             static_graph=True,
         )
     replay_buffer = TrajectoryReplayBuffer(Path(out_dir) / "replay" / "selfplay_robust.jsonl")
-    event_sink = JsonlEventSink(Path(out_dir) / "events" / "stage4_robust_rl.jsonl")
+    event_sink = JsonlEventSink(Path(out_dir) / "events" / "stage4_robust_rl.jsonl") if runtime.is_rank0 else None
     warmup_n = n_cards if int(steps) <= 1 else min(3, n_cards)
-    curriculum = ProgressiveCurriculum(target_n=n_cards, warmup_n=warmup_n, ramp_every=max(1, int(steps) // max(1, n_cards - warmup_n + 1)))
-    rng = random.Random(17 + n_cards + batch_size)
-    last_q = last_actor = last_pg = last_entropy = 0.0
-    trajectories_total = transitions_total = 0
+    curriculum = ProgressiveCurriculum(
+        target_n=n_cards,
+        warmup_n=warmup_n,
+        ramp_every=max(1, int(steps) // max(1, n_cards - warmup_n + 1)),
+    )
+    rollout_rng = random.Random(rank_seed)
+    replay_rng = random.Random(derive_rank_seed(int(seed) + 97, 0))
+    last_q = last_actor = last_entropy = 0.0
+    last_regret_scale = last_min_logit = last_max_logit = last_logit_gap = 0.0
+    last_grad_norm = 0.0
+    last_unique_gathered_hashes = 0
+    last_duplicate_gathered_hashes = 0
+    last_training_trajectories = 0
+    last_unique_training_hashes = 0
+    local_trajectories_total = 0
+    local_transitions_total = 0
+    global_trajectories_total = 0
+    global_transitions_total = 0
     curriculum_path = Path(out_dir) / "curriculum" / "stage4_manifest.json"
     curriculum_path.parent.mkdir(parents=True, exist_ok=True)
     curriculum_path.write_text(json.dumps(curriculum.manifest(steps=int(steps)), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -810,35 +897,77 @@ def run_stage4_robust_rl(
         cstep = curriculum.at(step)
         collector = getattr(model, "module", model)
         collector.eval()
+        shard_start, shard_count = _rank_shard_range(batch_size, runtime.rank, runtime.world_size)
         trajectories = [
             _rollout_selfplay_game(
                 collector,
                 n_cards=cstep.n_cards,
-                rng=rng,
+                rng=rollout_rng,
                 device=device,
                 model_version=f"stage4_step_{step}",
-                game_index=step * batch_size + i,
-            )
-            for i in range(int(batch_size))
-        ]
-        if runtime.is_rank0:
-            replay_buffer.append_many(trajectories)
-            event_sink.emit(
-                BaseEvent(
-                    event_type="STAGE4_SELFPLAY_COLLECTED",
-                    run_id="stage4_robust_rl",
+                game_index=step * batch_size + shard_start + i,
+                sample_id=_trajectory_sample_id(
+                    stage="stage4_robust_rl",
+                    rank=runtime.rank,
                     step=step,
-                    payload={
-                        "curriculum_n": cstep.n_cards,
-                        "trajectories": len(trajectories),
-                        "transitions": sum(len(t.rounds) for t in trajectories),
-                        "mean_final_score_diff": sum(t.final_score_diff for t in trajectories) / max(len(trajectories), 1),
-                    },
-                )
+                    game_index=step * batch_size + shard_start + i,
+                    seed=rank_seed,
+                    n_cards=cstep.n_cards,
+                ),
             )
-        trajectories_total += len(trajectories)
-        sampled_trajectories = replay_buffer.sample(batch_size, rng) if runtime.is_rank0 else trajectories
-        states, action_self, action_opp, mc_returns = _flatten_trajectory_batch(sampled_trajectories or trajectories)
+            for i in range(shard_count)
+        ]
+        gathered = all_gather_objects(trajectories)
+        all_trajectories = _flatten_trajectory_lists(gathered)
+        gathered_hashes = [_trajectory_hash(traj) for traj in all_trajectories]
+        unique_gathered_hashes = len(set(gathered_hashes))
+        last_unique_gathered_hashes = unique_gathered_hashes
+        last_duplicate_gathered_hashes = len(gathered_hashes) - unique_gathered_hashes
+        local_trajectories_total += len(trajectories)
+        local_transitions_total += sum(len(t.rounds) for t in trajectories)
+        global_trajectories_total += len(all_trajectories)
+        global_transitions_total += sum(len(t.rounds) for t in all_trajectories)
+        if runtime.is_rank0:
+            replay_buffer.append_many(all_trajectories)
+            if event_sink is not None:
+                event_sink.emit(
+                    BaseEvent(
+                        event_type="STAGE4_SELFPLAY_COLLECTED",
+                        run_id="stage4_robust_rl",
+                        step=step,
+                        payload={
+                            "curriculum_n": cstep.n_cards,
+                            "trajectories": len(all_trajectories),
+                            "per_rank_trajectories": [len(batch) for batch in gathered],
+                            "global_rollout_batch_size": int(batch_size),
+                            "rank_shard_counts": [
+                                _rank_shard_range(batch_size, r, runtime.world_size)[1]
+                                for r in range(runtime.world_size)
+                            ],
+                            "transitions": sum(len(t.rounds) for t in all_trajectories),
+                            "mean_final_score_diff": sum(t.final_score_diff for t in all_trajectories) / max(len(all_trajectories), 1),
+                            "unique_trajectory_hashes": unique_gathered_hashes,
+                            "duplicate_trajectory_hashes": last_duplicate_gathered_hashes,
+                        },
+                    )
+                )
+        if runtime.is_rank0:
+            sampled_trajectories = replay_buffer.sample(batch_size, replay_rng)
+            training_trajectories = sampled_trajectories or _stable_trajectory_prefix(
+                all_trajectories,
+                int(batch_size),
+            )
+        else:
+            training_trajectories = None
+        training_trajectories = broadcast_object(training_trajectories, src=0)
+        if not training_trajectories:
+            raise RuntimeError("stage4 produced no training trajectories")
+        training_hashes = [_trajectory_hash(traj) for traj in training_trajectories]
+        last_training_trajectories = len(training_trajectories)
+        last_unique_training_hashes = len(set(training_hashes))
+        states, action_self, action_opp, mc_returns = _flatten_trajectory_batch(training_trajectories)
+        if not states:
+            raise RuntimeError("stage4 training trajectories produced no decision states")
         batch = public_state_from_game(states, max_cards=13, device=device)
         idx = torch.arange(len(states), device=device)
         action_self_t = torch.tensor(action_self, dtype=torch.long, device=device)
@@ -851,34 +980,29 @@ def run_stage4_robust_rl(
         chosen_q = out.q_robust[idx, action_self_t, action_opp_t]
         bootstrapped_returns = 0.8 * returns_t + 0.2 * target_out.q_robust[idx, action_self_t, action_opp_t].detach()
         q_loss = F.smooth_l1_loss(chosen_q, bootstrapped_returns, beta=0.1)
-        logp = F.log_softmax(out.robust_policy_logits, dim=-1)[idx, action_self_t]
-        baseline = chosen_q.detach()
-        pg_loss = -(logp * (returns_t - baseline)).mean()
-        policy = F.softmax(out.robust_policy_logits, dim=-1)
-        entropy = -(policy * F.log_softmax(out.robust_policy_logits, dim=-1)).sum(dim=-1).mean()
-        # NeuRD robust actor (Phase 1.1). The former `neurd_loss` contracted Q with
-        # `max_b` over opponent actions on the *self* payoff — i.e. it pulled the
-        # actor toward the BEST-case opponent, the opposite of robust, fighting the
-        # RM+ minimax anchor. We now use `row_action_regret`, which contracts Q
-        # against the RM+ equilibrium column policy (`sol.column_policy`) — the
-        # worst-case-consistent opponent the anchor itself computed — so the actor
-        # gradient and the Nash anchor pull the same direction (toward minimax).
+        centered_logits = legal_logits(out.robust_policy_logits, batch.self_action_mask)
+        masked_logits = out.robust_policy_logits.masked_fill(~batch.self_action_mask, -1e9)
+        policy = F.softmax(centered_logits, dim=-1)
+        log_policy = F.log_softmax(centered_logits, dim=-1)
+        entropy = -(policy * log_policy).sum(dim=-1).mean()
         action_regret = row_action_regret(
             out.q_robust.detach(),
             policy.detach(),
             sol.column_policy.detach(),
             batch.self_action_mask,
         )
-        self_mask_f = batch.self_action_mask.float()
-        denom = self_mask_f.sum(dim=-1).clamp_min(1.0)
-        actor_loss = -(
-            (action_regret.detach() * out.robust_policy_logits * self_mask_f).sum(dim=-1) / denom
-        ).mean()
-        anchor = F.kl_div(F.log_softmax(out.robust_policy_logits, dim=-1), sol.row_policy.detach(), reduction="batchmean")
-        loss = q_loss + actor_loss + pg_loss + 0.1 * anchor - 0.01 * entropy
+        actor_loss, centered_actor_logits, thresholded_force = neurd_actor_loss_from_regret(
+            out.robust_policy_logits,
+            action_regret,
+            batch.self_action_mask,
+            threshold=NEURD_LOGIT_THRESHOLD,
+            threshold_step_size=lr,
+        )
+        anchor = F.kl_div(log_policy, sol.row_policy.detach(), reduction="batchmean")
+        loss = q_loss + actor_loss + 0.1 * anchor
         opt_q.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        last_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
         opt_q.step()
         with torch.no_grad():
             source_model = getattr(model, "module", model)
@@ -886,9 +1010,15 @@ def run_stage4_robust_rl(
                 target_param.mul_(0.995).add_(source_param.detach(), alpha=0.005)
         last_q = float(q_loss.detach().cpu())
         last_actor = float(actor_loss.detach().cpu())
-        last_pg = float(pg_loss.detach().cpu())
         last_entropy = float(entropy.detach().cpu())
-        transitions_total += len(states)
+        self_mask_f = batch.self_action_mask.float()
+        denom = self_mask_f.sum(dim=-1).clamp_min(1.0)
+        last_regret_scale = float((thresholded_force.abs() * self_mask_f).sum(dim=-1).div(denom).mean().detach().cpu())
+        finite_logits = centered_actor_logits[batch.self_action_mask.bool()]
+        if finite_logits.numel() > 0:
+            last_min_logit = float(finite_logits.min().detach().cpu())
+            last_max_logit = float(finite_logits.max().detach().cpu())
+            last_logit_gap = last_max_logit - last_min_logit
         if logger is not None and _should_log_step(step, int(steps)):
             logger.step_metrics(
                 "stage4_robust_rl",
@@ -897,25 +1027,52 @@ def run_stage4_robust_rl(
                 {
                     "q": last_q,
                     "actor": last_actor,
-                    "pg": last_pg,
                     "entropy": last_entropy,
+                    "min_logit": last_min_logit,
+                    "max_logit": last_max_logit,
+                    "logit_gap": last_logit_gap,
+                    "regret_scale": last_regret_scale,
+                    "grad_norm": last_grad_norm,
                     "curriculum_n": cstep.n_cards,
+                    "global_training_trajectories": last_training_trajectories,
+                    "unique_training_hashes": last_unique_training_hashes,
+                    "neurd_logit_threshold": NEURD_LOGIT_THRESHOLD,
                 },
             )
 
-    checkpoint_path = None
     stage_metrics = {
         "q_loss_last": last_q,
         "actor_loss_last": last_actor,
-        "policy_gradient_loss_last": last_pg,
+        "policy_gradient_loss_last": 0.0,
+        "policy_gradient_removed": 1.0,
         "entropy_last": last_entropy,
-        "selfplay_trajectories": float(trajectories_total),
-        "selfplay_transitions": float(transitions_total),
+        "min_logit_last": last_min_logit,
+        "max_logit_last": last_max_logit,
+        "logit_gap_last": last_logit_gap,
+        "regret_scale_last": last_regret_scale,
+        "grad_norm_last": last_grad_norm,
+        "neurd_logit_threshold": float(NEURD_LOGIT_THRESHOLD),
+        "neurd_threshold_step_size": float(lr),
+        "selfplay_trajectories": float(global_trajectories_total),
+        "selfplay_local_trajectories": float(local_trajectories_total),
+        "selfplay_transitions": float(global_transitions_total),
+        "selfplay_local_transitions": float(local_transitions_total),
+        "global_training_batch_trajectories": float(last_training_trajectories),
+        "unique_training_trajectory_hashes": float(last_unique_training_hashes),
+        "unique_gathered_trajectory_hashes_last": float(last_unique_gathered_hashes),
+        "duplicate_gathered_trajectory_hashes_last": float(last_duplicate_gathered_hashes),
+        "distributed_replay_semantics": 1.0,
         "replay_samples": float(replay_buffer.count()) if runtime.is_rank0 else 0.0,
+        "replay_persisted_samples": float(replay_buffer.persisted_count()) if runtime.is_rank0 else 0.0,
+        "rank_seed": float(rank_seed),
+        "world_size": float(runtime.world_size),
+        "global_rollout_batch_size": float(batch_size),
+        "per_rank_rollout_batch_size": float(_rank_shard_range(batch_size, runtime.rank, runtime.world_size)[1]),
         "target_network_ema": 0.995,
         "curriculum_final_n": float(curriculum.at(max(0, int(steps) - 1)).n_cards),
     }
     promotion = evaluate_promotion_candidate(stage_metrics)
+    checkpoint_path = None
     promotion_artifact = None
     if runtime.is_rank0:
         ckpt = Path(out_dir) / "stage4_robust_rl.pt"
@@ -929,7 +1086,21 @@ def run_stage4_robust_rl(
                 training_stage="P4_ROBUST_RL",
                 global_step=int(steps),
                 policy_version=2,
-                config={"steps": steps, "batch_size": batch_size, "n_cards": n_cards, "lr": lr, "world_size": runtime.world_size},
+                config={
+                    "steps": steps,
+                    "batch_size": batch_size,
+                    "global_training_batch_size": batch_size,
+                    "global_rollout_batch_size": batch_size,
+                    "per_rank_rollout_rule": "contiguous shard of global_rollout_batch_size",
+                    "n_cards": n_cards,
+                    "lr": lr,
+                    "seed": seed,
+                    "world_size": runtime.world_size,
+                    "rank_seed_rule": "seed + rank",
+                    "replay_semantics": "rank0_global_replay_sample_then_broadcast_to_all_ranks",
+                    "neurd_logit_threshold": NEURD_LOGIT_THRESHOLD,
+                    "neurd_threshold_step_size": lr,
+                },
                 metrics=stage_metrics,
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
@@ -939,38 +1110,39 @@ def run_stage4_robust_rl(
             ),
             extra={
                 "replay_path": str(replay_buffer.path),
-                "event_log": str(event_sink.path),
+                "event_log": str(event_sink.path if event_sink is not None else ""),
                 "curriculum": str(curriculum_path),
                 "promotion": promotion_artifact,
                 "target_model_state": target_model.state_dict(),
             },
         )
         registry = CheckpointRegistry(Path(out_dir) / "registry")
-        # Register only `latest`. The former best_robust/best_raw/best_search/
-        # best_generalization aliases all pointed at this same file, implying a
-        # per-axis model selection that never ran. Re-introduce a `best_*` alias
-        # only when an evaluation actually selects a distinct checkpoint for it.
         registry.register("latest", ckpt, global_step=int(steps), metrics=stage_metrics)
         checkpoint_path = manifest["path"]
         if logger is not None:
             logger.checkpoint_saved("stage4_robust_rl", checkpoint_path, global_step=int(steps))
     barrier_if_distributed()
     stage_metrics["promotion_candidate"] = 1.0 if promotion.decision == "PROMOTE_CANDIDATE" else 0.0
-    stage_metrics["replay_persisted_samples"] = float(replay_buffer.persisted_count()) if runtime.is_rank0 else 0.0
+    payload = {
+        "checkpoint": checkpoint_path,
+        "metrics": stage_metrics,
+        "rank_owner": 0.0,
+    } if runtime.is_rank0 else None
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage4 payload broadcast failed")
     return StageMetrics(
         "P4_ROBUST_RL",
         int(steps),
-        stage_metrics,
-        checkpoint_path,
+        payload["metrics"],
+        payload["checkpoint"],
     )
-
-
 def _opponent_regime_distribution(regime_id: str, legal: list[int], *, stake: int, n_cards: int) -> dict[int, float]:
     """The TRUE next-action distribution of a scripted regime (the label P5 fits).
 
     ``opponent_action_for_regime`` samples an action; here we expose the full
     categorical it samples from, so P5 can train the opponent head against a real
-    probability target and measure a real NLL/ECE against it — not a constant."""
+    probability target and measure a real NLL/ECE against it, not a constant."""
     if not legal:
         raise ValueError("distribution requires at least one legal action")
     threshold = max(1, n_cards // 2)
@@ -990,7 +1162,7 @@ def _build_adaptive_training_tensors(sessions, *, max_cards, device):
       * public state is reconstructed from the round (masks shrink as cards are played);
       * intra-game history is the rounds of THIS game so far (feeds the LSTM);
       * inter-game memory is a per-game summary sequence of PRIOR games this
-        session (feeds the Mamba) — so the long-horizon head sees real cross-game
+        session (feeds the Mamba), so the long-horizon head sees real cross-game
         context, the whole point of the session structure;
       * target is the opponent's actual next action index (for NLL/accuracy).
     """
@@ -1145,58 +1317,68 @@ def run_stage5_adaptive(
     resume_checkpoint: str | Path | None = None,
     logger: "TrainingLogger | None" = None,
 ) -> StageMetrics:
-    """P5 — TRAIN the opponent/adaptive branch on scripted-regime sessions.
+    """P5 trains the opponent/adaptive branch behind a hard firewall.
 
-    Phase 3.2: this stage no longer emits a constant-NLL diagnostic.  It builds
-    real multi-game opponent sessions, then runs supervised training of the
-    opponent-prediction heads (short/long/fused) — the LSTM, Mamba, memory fusion
-    and opponent heads — against each regime's TRUE next-action distribution.
-
-    Phase 3.2b — explicit gradient firewall.  The robust backbone/Q/actor are
-    *frozen by `requires_grad_(False)`*, not merely shielded by `.detach()`.  We
-    optimize ONLY `model.adaptive_parameters()`, and after every step assert the
-    firewall directly (`‖Δθ_R‖ == 0` and `‖∇θ_A‖ > 0`) so a future refactor that
-    leaks gradient into robust is caught here, in the run itself.
+    Only rank0 executes the adaptive training loop and writes the checkpoint.
+    Other ranks wait at the stage barrier and then receive the exact same stage
+    result through a broadcast, so downstream state stays aligned without racing
+    the checkpoint path.
     """
     torch, F = _torch_import()
     from goofspiel.models import GoofspielModel
 
+    runtime, _ = setup_torch_distributed("cpu")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("stage5 payload broadcast failed")
+        barrier_if_distributed()
+        return StageMetrics("P5_ADAPTIVE", int(steps), payload["metrics"], payload["checkpoint"])
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(503 + int(steps) + int(n_cards))
+    seed = 503 + int(steps) + int(n_cards)
+    rng = random.Random(seed)
     sessions_path = out / "adaptive" / "opponent_sessions.jsonl"
     sessions = JsonlStore(sessions_path)
     session_rows = []
     regimes = default_opponent_curriculum()
-    # --- Build the opponent sessions: several GAMES per session so the inter-game
-    #     Mamba memory has real cross-game context to carry. ---
     games_per_session = 3
     for session_idx in range(max(1, int(steps))):
         regime = regimes[session_idx % len(regimes)]
         games: list[list[RoundRecord]] = []
-        for _ in range(games_per_session):
+        for game_idx in range(games_per_session):
             first_prize = rng.choice(list(range(1, n_cards + 1)))
             state = GameState.initial(n_cards, current_prize=first_prize)
             rounds = []
             while not state.done:
                 self_action = rng.choice(state.self_actions)
                 opp_action = opponent_action_for_regime(
-                    regime.regime_id, state.opponent_actions,
-                    stake=state.stake, n_cards=n_cards, rng=rng,
+                    regime.regime_id,
+                    state.opponent_actions,
+                    stake=state.stake,
+                    n_cards=n_cards,
+                    rng=rng,
                 )
                 next_prize = rng.choice(legal_cards(state.prize_mask, state.n)) if state.prize_mask else None
                 result = transition(state, self_action, opp_action, next_prize=next_prize)
-                rounds.append(RoundRecord(
-                    round_index=state.round_index, prize=state.current_prize,
-                    self_action=self_action, opponent_action=opp_action,
-                    reward_self=result.reward_self, reward_opponent=result.reward_opp,
-                    carry_in=state.carry_pool, carry_out=result.state.carry_pool,
-                    done=result.state.done,
-                ))
+                rounds.append(
+                    RoundRecord(
+                        round_index=state.round_index,
+                        prize=state.current_prize,
+                        self_action=self_action,
+                        opponent_action=opp_action,
+                        reward_self=result.reward_self,
+                        reward_opponent=result.reward_opp,
+                        carry_in=state.carry_pool,
+                        carry_out=result.state.carry_pool,
+                        done=result.state.done,
+                    )
+                )
                 state = result.state
             games.append(rounds)
         session = OpponentSession(
-            session_id=f"adaptive_session_{session_idx}_{uuid.uuid4().hex}",
+            session_id=f"adaptive_session_{session_idx}:seed{seed}:n{n_cards}",
             opponent_id=f"curriculum_{regime.regime_id}",
             strategy_regime_id=regime.regime_id,
             games=games,
@@ -1205,9 +1387,7 @@ def run_stage5_adaptive(
         session_rows.append(session)
     rounds_total = sum(len(g) for s in session_rows for g in s.games)
 
-    # --- Featurize and train the opponent/adaptive branch (robust FROZEN). ---
-    device = "cpu"
-    model = GoofspielModel(max_cards=13).to(device)
+    model = GoofspielModel(max_cards=13).to("cpu")
     model.assert_partition_is_complete()
     opt = torch.optim.AdamW(model.adaptive_parameters(), lr=lr)
     lineage = _apply_init_or_resume(
@@ -1216,15 +1396,12 @@ def run_stage5_adaptive(
         resume_checkpoint_path=resume_checkpoint,
         optimizers={"adaptive_sft": opt},
     )
-    # The firewall: freeze robust params EXPLICITLY (Phase 3.2b), not via detach.
     model.set_robust_requires_grad(False)
 
-    tensors = _build_adaptive_training_tensors(session_rows, max_cards=13, device=device)
+    tensors = _build_adaptive_training_tensors(session_rows, max_cards=13, device="cpu")
     if tensors is None:
         raise RuntimeError("P5 produced no training rows from the opponent sessions")
     batch, history, memory, target_t, n_cards_row = tensors
-    # Uniform reference NLL per decision point (the honest bar to beat), computed
-    # from the actual legal-action counts, not a single scalar.
     legal_counts = batch.opponent_action_mask.sum(dim=-1).clamp_min(1).float()
     uniform_reference_nll = float(torch.log(legal_counts).mean())
 
@@ -1234,11 +1411,8 @@ def run_stage5_adaptive(
     model.train()
     for _step in range(train_steps):
         out_model = model(batch, current_game_history=history, long_term_memory=memory)
-        # Train the FUSED opponent head (short+long context combined). Masked to
-        # legal opponent actions so the categorical is over legal cards only.
         logits = out_model.opponent_fused_logits
         loss = F.cross_entropy(logits, target_t)
-        # Auxiliary short/long supervision keeps both memory paths learning.
         loss = loss + 0.5 * F.cross_entropy(out_model.opponent_short_logits, target_t)
         loss = loss + 0.5 * F.cross_entropy(out_model.opponent_long_logits, target_t)
         opt.zero_grad(set_to_none=True)
@@ -1247,7 +1421,6 @@ def run_stage5_adaptive(
             (p.grad.detach().float().pow(2).sum() for p in model.adaptive_parameters() if p.grad is not None),
             torch.tensor(0.0),
         )))
-        # No robust param may carry gradient at all (frozen ⇒ grad is None).
         robust_with_grad = [p for p in model.robust_parameters() if p.grad is not None]
         if robust_with_grad:
             raise AssertionError(f"{len(robust_with_grad)} robust params received gradient in P5 (firewall breach)")
@@ -1258,8 +1431,7 @@ def run_stage5_adaptive(
             nll = float(F.cross_entropy(logits, target_t))
             acc = float((probs.argmax(dim=-1) == target_t).float().mean())
             ece = _expected_calibration_error(probs, target_t)
-        last = {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm,
-                "robust_delta": 0.0}
+        last = {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm, "robust_delta": 0.0}
         if logger is not None and _should_log_step(_step, train_steps):
             logger.step_metrics(
                 "stage5_adaptive",
@@ -1267,13 +1439,10 @@ def run_stage5_adaptive(
                 train_steps,
                 {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm},
             )
-    # Firewall assertion #2: robust params are byte-for-byte unchanged.
-    robust_delta = float(sum(
-        (a - b).abs().sum() for a, b in zip(model.robust_parameters(), robust_snapshot)
-    ))
+    robust_delta = float(sum((a - b).abs().sum() for a, b in zip(model.robust_parameters(), robust_snapshot)))
     last["robust_delta"] = robust_delta
     if robust_delta != 0.0:
-        raise AssertionError(f"robust params moved during P5 (‖Δθ_R‖={robust_delta} ≠ 0): firewall breach")
+        raise AssertionError(f"robust params moved during P5 ({robust_delta} != 0): firewall breach")
 
     oracle = oracle_opponent_diagnostic(session_rows, n_cards=n_cards)
     beats_uniform = last["nll"] < uniform_reference_nll
@@ -1288,7 +1457,7 @@ def run_stage5_adaptive(
             training_stage="P5_ADAPTIVE",
             global_step=train_steps,
             policy_version=3,
-            config={"steps": steps, "n_cards": n_cards, "lr": lr, "games_per_session": games_per_session},
+            config={"steps": steps, "n_cards": n_cards, "lr": lr, "games_per_session": games_per_session, "seed": seed},
             metrics={
                 "opponent_nll": last["nll"],
                 "uniform_reference_nll": uniform_reference_nll,
@@ -1306,9 +1475,24 @@ def run_stage5_adaptive(
     if logger is not None:
         logger.checkpoint_saved("stage5_adaptive", ckpt_path, global_step=train_steps)
 
+    stage_metrics = {
+        "opponent_model_usable": 1.0 if beats_uniform else 0.0,
+        "opponent_sessions": float(max(1, int(steps))),
+        "opponent_rounds": float(rounds_total),
+        "opponent_nll": float(last["nll"]),
+        "uniform_reference_nll": float(uniform_reference_nll),
+        "nll_gain_over_uniform": float(uniform_reference_nll - last["nll"]),
+        "opponent_accuracy": float(last["acc"]),
+        "opponent_ece": float(last["ece"]),
+        "opponent_regimes": float(len({s.strategy_regime_id for s in session_rows})),
+        "oracle_gain": float(oracle["oracle_gain"]),
+        "switch_delay": float(oracle["switch_delay"]),
+        "robust_param_delta_l1": float(robust_delta),
+        "adaptive_grad_norm_last": float(last["adaptive_grad_norm"]),
+        "stage5_rank_owner": 0.0,
+        "stage5_write_once": 1.0,
+    }
     report = {
-        # A trained opponent model now exists. It is usable iff it beat the honest
-        # uniform reference on these scripted regimes.
         "opponent_model_usable": bool(beats_uniform),
         "gate": "OPPONENT_MODEL_TRAINED" if beats_uniform else "OPPONENT_MODEL_BELOW_UNIFORM",
         "calibration": {
@@ -1324,7 +1508,6 @@ def run_stage5_adaptive(
             "oracle_gain": oracle["oracle_gain"],
             "switch_delay": oracle["switch_delay"],
         },
-        # 3.2b firewall evidence, recorded in the artifact itself.
         "firewall": {
             "robust_frozen": True,
             "robust_param_delta_l1": robust_delta,
@@ -1336,28 +1519,17 @@ def run_stage5_adaptive(
         "checkpoint": ckpt_path,
     }
     (out / "adaptive" / "adaptive_gate_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    return StageMetrics(
-        "P5_ADAPTIVE",
-        int(steps),
-        {
-            "opponent_model_usable": 1.0 if beats_uniform else 0.0,
-            "opponent_sessions": float(max(1, int(steps))),
-            "opponent_rounds": float(rounds_total),
-            "opponent_nll": float(last["nll"]),
-            "uniform_reference_nll": float(uniform_reference_nll),
-            "nll_gain_over_uniform": float(uniform_reference_nll - last["nll"]),
-            "opponent_accuracy": float(last["acc"]),
-            "opponent_ece": float(last["ece"]),
-            "opponent_regimes": float(len({s.strategy_regime_id for s in session_rows})),
-            "oracle_gain": float(oracle["oracle_gain"]),
-            "switch_delay": float(oracle["switch_delay"]),
-            "robust_param_delta_l1": float(robust_delta),
-            "adaptive_grad_norm_last": float(last["adaptive_grad_norm"]),
-        },
-        ckpt_path,
-    )
-
-
+    payload = {
+        "checkpoint": ckpt_path,
+        "metrics": stage_metrics,
+        "report": report,
+        "rank_owner": 0.0,
+    }
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage5 payload broadcast failed")
+    barrier_if_distributed()
+    return StageMetrics("P5_ADAPTIVE", int(steps), payload["metrics"], payload["checkpoint"])
 def _sample_from_policy(policy: list[float], legal: list[int], rng: random.Random) -> int:
     weights = [max(0.0, float(policy[card - 1])) for card in legal]
     total = sum(weights)
@@ -1402,13 +1574,20 @@ def _mint_league_snapshot(role: str, *, out_dir: Path, seed: int, n_cards: int =
 
     Each role is trained from a different torch seed so the three snapshots are
     *genuinely distinct* trained agents (verified by cross-play, not asserted).
-    This is deliberately minimal — the point of Phase 4.3 is that the league
+    This is deliberately minimal: the point of Phase 4.3 is that the league
     plays *real, loadable, distinct* checkpoints, not that they are strong.
     """
     torch, _F = _torch_import()
     torch.manual_seed(seed)
     snap_dir = out_dir / "league" / "snapshots" / role.lower()
-    metrics = run_stage1_pretrain(steps=1, batch_size=4, out_dir=snap_dir, n_cards=n_cards, lr=3e-4)
+    metrics = run_stage1_pretrain(
+        steps=1,
+        batch_size=4,
+        out_dir=snap_dir,
+        n_cards=n_cards,
+        lr=3e-4,
+        seed=seed,
+    )
     return metrics.checkpoint
 
 
@@ -1489,7 +1668,7 @@ def run_stage6_league(
             )
 
     # Handcrafted algorithms are kept only as clearly-LABELLED reference
-    # opponents — never conflated with the trained cross-play above.
+    # opponents, never conflated with the trained cross-play above.
     from goofspiel.training.baseline_algorithms import create_baseline
 
     reference_by_role = {
@@ -1611,7 +1790,7 @@ def run_stage7_redteam(
     for idx, state in enumerate(attack_states):
         sample = router.label_state(state)
         teacher_samples.append(sample)
-        # The teacher's recommended action (argmax over legal cards) — the target
+        # The teacher's recommended action (argmax over legal cards), the target
         # the focused correction trains toward and the regression re-checks.
         pol = sample.teacher_policy or [1.0] * len(state.self_actions)
         best_index = max(range(len(state.self_actions)), key=lambda i: pol[i])
@@ -1794,7 +1973,7 @@ def run_evaluation_suite(*, out_dir: str | Path, num_games: int = 16, checkpoint
         ]
     }
     path.write_text(__import__("json").dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    # Phase 5: the benchmark is model-aware — E2/E6 become the trained policy's
+    # Phase 5: the benchmark is model-aware; E2/E6 become the trained policy's
     # REAL play vs Random when a checkpoint is supplied (never the Heuristic-vs-
     # Random reference), and G2 becomes a real robustness verdict on it.
     benchmark = run_unified_benchmark(
@@ -1814,13 +1993,13 @@ def run_axis_promotion_selection(
     num_games: int = 24,
     seed: int = 1,
 ) -> dict[str, Any]:
-    """Phase 5 — register ``best_*`` aliases from THEIR OWN evaluations.
+    """Phase 5: register ``best_*`` aliases from THEIR OWN evaluations.
 
     Each candidate checkpoint is re-played through the 0.1 harness on three
     distinct axes (raw robust score, full-game exploitability, worst-N
     generalization); ``best_robust`` / ``best_search`` / ``best_generalization``
     are then the per-axis winners.  Because the axes optimise different
-    quantities, the winners can be *different files* — the alias is no longer an
+    quantities, the winners can be *different files*, so the alias is no longer an
     unconditional copy of the P4 checkpoint.  ``latest`` still tracks the primary
     (last) candidate.  Every metric written here is computed, never a literal.
     """
@@ -1887,7 +2066,7 @@ def _smoke_algorithmic_check(
 ) -> dict[str, Any]:
     """Re-execute the Phase 0.1 honest evaluator on the produced checkpoint.
 
-    Returns a dict whose ``algorithmic_ok`` is computed — never a literal — from
+    Returns a dict whose ``algorithmic_ok`` is computed, never a literal, from
     the trained policy's mean score-diff versus Random through the real env. If no
     checkpoint was produced (e.g. non-rank0), the gate cannot pass and says so.
     """
@@ -1946,7 +2125,7 @@ def run_smoke_pipeline(
     emit("stage1_pretrain", {"ok": True, "metrics": stage1.metrics, "checkpoint": stage1.checkpoint})
     stage2 = run_stage2_semi_supervised(steps=steps, out_dir=out / "data", n_cards=n_cards)
     emit("stage2_semi_supervised", {"ok": True, "metrics": stage2.metrics})
-    # Phase 3.1: chain θ forward. P3 inherits P1's weights (θ-only, fresh
+    # Phase 3.1: chain theta forward. P3 inherits P1's weights (theta-only, fresh
     # optimizer); P4 inherits P3's. This is init_from_checkpoint, NOT resume.
     stage3 = run_stage3_sft(
         steps=steps, batch_size=batch_size, out_dir=out / "checkpoints", device=device, n_cards=n_cards,
@@ -1963,8 +2142,8 @@ def run_smoke_pipeline(
         init_from_checkpoint=stage4.checkpoint,
     )
     emit("stage5_adaptive", {"ok": True, "metrics": stage5.metrics, "checkpoint": stage5.checkpoint})
-    # Phase 4.3: the league plays REAL trained snapshots produced by this run —
-    # P4 (robust backbone), P3 (strategic SFT), P5 (adaptive/exploiter) — not
+    # Phase 4.3: the league plays REAL trained snapshots produced by this run:
+    # P4 (robust backbone), P3 (strategic SFT), P5 (adaptive/exploiter), not
     # role-keyed handcrafted baselines.
     stage6 = run_stage6_league(
         out_dir=out,

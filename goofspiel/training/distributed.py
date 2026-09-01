@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
+import random
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +156,62 @@ def setup_torch_distributed(device: str = "cpu") -> tuple[DistributedRuntime, st
             backend = "nccl" if resolved_device.startswith("cuda") else "gloo"
             dist.init_process_group(backend=backend)
     return runtime, resolved_device
+
+
+def derive_rank_seed(seed: int, rank: int) -> int:
+    """Derive a deterministic per-rank seed from a run seed.
+
+    The training stages use this to give each rank its own RNG stream while
+    keeping the same seed + same world size reproducible.
+    """
+    return int(seed) + int(rank)
+
+
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and Torch deterministically."""
+    random.seed(int(seed))
+    try:
+        import numpy as np
+
+        np.random.seed(int(seed) % (2**32))
+    except Exception:
+        pass
+    try:
+        import torch
+
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+    except Exception:
+        pass
+
+
+def all_gather_objects(obj: Any) -> list[Any]:
+    """All-gather a Python object across ranks when distributed is active."""
+    runtime = current_runtime()
+    if not runtime.is_distributed:
+        return [obj]
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return [obj]
+    gathered: list[Any] = [None for _ in range(runtime.world_size)]
+    dist.all_gather_object(gathered, obj)
+    return gathered
+
+
+def broadcast_object(obj: Any, *, src: int = 0) -> Any:
+    """Broadcast a Python object from src to all ranks when distributed."""
+    runtime = current_runtime()
+    if not runtime.is_distributed:
+        return obj
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return obj
+    payload = [obj if runtime.rank == src else None]
+    dist.broadcast_object_list(payload, src=src)
+    return payload[0]
 
 
 def barrier_if_distributed() -> None:

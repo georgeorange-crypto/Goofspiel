@@ -11,6 +11,7 @@ from goofspiel.env import PLAYER_0, PLAYER_1, GoofspielEnv
 from goofspiel.game import GameState, transition
 from goofspiel.solver import estimate_complexity, solve_zero_sum_matrix
 from goofspiel.training.data import GameCorpusSample, JsonlStore, state_record_from_game_state
+from goofspiel.training.distributed import barrier_if_distributed, broadcast_object, current_runtime, setup_torch_distributed
 
 Q_PRIORITY = ("EXACT", "CERTIFIED_SEARCH", "NASH_BELLMAN")
 POLICY_PRIORITY = ("EXACT", "CERTIFIED_CFR_SEARCH", "REFERENCE_NASH_Q", "TRAINING_NASH_Q")
@@ -31,6 +32,16 @@ def _record(report: VerificationReport, name: str, ok: bool, error: str | None =
 
 
 def run_stage0_verify(*, artifact_dir: str | Path = "artifacts/runs/stage0_verify") -> VerificationReport:
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed("auto")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("stage0 payload broadcast failed")
+        barrier_if_distributed()
+        return VerificationReport(**payload)
+
     report = VerificationReport(ok=True)
 
     try:
@@ -95,4 +106,14 @@ def run_stage0_verify(*, artifact_dir: str | Path = "artifacts/runs/stage0_verif
         _record(report, "teacher_priority_contract", False, repr(exc))
 
     report.ok = all(report.checks.values())
-    return report
+    payload = {
+        "ok": report.ok,
+        "checks": report.checks,
+        "metrics": report.metrics,
+        "errors": report.errors,
+    }
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage0 payload broadcast failed")
+    barrier_if_distributed()
+    return VerificationReport(**payload)

@@ -7,7 +7,6 @@ import itertools
 import json
 import random
 import shutil
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -58,6 +57,21 @@ class StageMetrics:
     checkpoint: str | None = None
 
 
+@dataclass(frozen=True)
+class _LocalRuntime:
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+
+    @property
+    def is_distributed(self) -> bool:
+        return False
+
+    @property
+    def is_rank0(self) -> bool:
+        return self.rank == 0
+
+
 def _torch_import():
     try:
         import torch
@@ -92,6 +106,39 @@ def _sample_states(batch_size: int, *, n: int, step: int) -> list[GameState]:
     for i in range(batch_size):
         p = prizes[(step + i) % n]
         states.append(GameState(n=n, self_mask=full, opp_mask=full, prize_mask=full & ~(1 << (p - 1)), current_prize=p))
+    return states
+
+
+def _ranked_step(step: int, runtime: Any) -> int:
+    """Map a per-rank loop step to a deterministic global data index."""
+    return int(step) * max(1, int(runtime.world_size)) + int(runtime.rank)
+
+
+def _corpus_batch_for_rank(
+    corpus_states: list[GameState],
+    *,
+    step: int,
+    batch_size: int,
+    runtime: Any,
+) -> list[GameState]:
+    """Select a rank-specific corpus shard while preserving reproducibility."""
+    if not corpus_states:
+        return []
+    start = (_ranked_step(step, runtime) * int(batch_size)) % len(corpus_states)
+    return [corpus_states[(start + i) % len(corpus_states)] for i in range(int(batch_size))]
+
+
+def _global_state_list(local_states: list[GameState], runtime: Any) -> list[GameState]:
+    """Gather per-rank training states for rank0 metrics/artifacts."""
+    if not getattr(runtime, "is_distributed", False):
+        return list(local_states)
+    return _flatten_state_lists(all_gather_objects(local_states))
+
+
+def _flatten_state_lists(batches: list[list[GameState]]) -> list[GameState]:
+    states: list[GameState] = []
+    for batch in batches:
+        states.extend(batch)
     return states
 
 
@@ -198,6 +245,7 @@ def run_stage1_pretrain(
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
     logger: "TrainingLogger | None" = None,
+    local_only: bool = False,
 ) -> StageMetrics:
     """P1 pretraining over swap, transition, joint-outcome, and opponent tasks.
 
@@ -210,7 +258,10 @@ def run_stage1_pretrain(
     from goofspiel.models import GoofspielModel, public_state_from_game
 
     seed_everything(int(seed))
-    runtime, device = setup_torch_distributed(device)
+    if local_only:
+        runtime = _LocalRuntime()
+    else:
+        runtime, device = setup_torch_distributed(device)
     model = GoofspielModel(max_cards=13).to(device)
     if runtime.is_distributed:
         # stage1 runs TWO forward passes (batch + swapped_batch) into a SINGLE
@@ -243,10 +294,14 @@ def run_stage1_pretrain(
     all_states: list[GameState] = []
     for step in range(int(steps)):
         if corpus_states:
-            start = (step * batch_size) % len(corpus_states)
-            states = [corpus_states[(start + i) % len(corpus_states)] for i in range(batch_size)]
+            states = _corpus_batch_for_rank(corpus_states, step=step, batch_size=batch_size, runtime=runtime)
         else:
-            states = sample_reachable_states(batch_size, n=n_cards, step=step, seed=1)
+            states = sample_reachable_states(
+                batch_size,
+                n=n_cards,
+                step=_ranked_step(step, runtime),
+                seed=int(seed),
+            )
         all_states.extend(states)
         batch = public_state_from_game(states, max_cards=13, device=device)
         p1_targets = [
@@ -310,13 +365,14 @@ def run_stage1_pretrain(
             )
 
     checkpoint_path = None
+    global_states = _global_state_list(all_states, runtime) if not local_only else list(all_states)
     if metrics:
-        metrics.update(coverage_report(all_states).as_metrics())
+        metrics.update(coverage_report(global_states).as_metrics())
     if runtime.is_rank0:
         out_dir = Path(out_dir)
         ckpt = out_dir / "stage1_pretrain.pt"
-        if all_states:
-            _write_coverage_artifact(out_dir, "stage1_pretrain", all_states)
+        if global_states:
+            _write_coverage_artifact(out_dir, "stage1_pretrain", global_states)
         manifest = save_checkpoint(
             ckpt,
             model=getattr(model, "module", model),
@@ -326,7 +382,18 @@ def run_stage1_pretrain(
                 training_stage="P1_PRETRAIN",
                 global_step=int(steps),
                 policy_version=0,
-                config={"steps": steps, "batch_size": batch_size, "n_cards": n_cards, "lr": lr, "seed": seed, "world_size": runtime.world_size},
+                config={
+                    "steps": steps,
+                    "batch_size": batch_size,
+                    "local_batch_size": batch_size,
+                    "global_batch_size": int(batch_size) * int(runtime.world_size),
+                    "n_cards": n_cards,
+                    "lr": lr,
+                    "seed": seed,
+                    "world_size": runtime.world_size,
+                    "local_only": bool(local_only),
+                    "ddp_data_semantics": "rank_sharded_reachable_or_corpus_states",
+                },
                 metrics=metrics or {"loss_last": 0.0},
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
@@ -348,8 +415,17 @@ def run_stage1_pretrain(
         checkpoint_path = manifest["path"]
         if logger is not None:
             logger.checkpoint_saved("stage1_pretrain", checkpoint_path, global_step=int(steps))
+    if local_only:
+        return StageMetrics("P1_PRETRAIN", int(steps), metrics or {"loss_last": 0.0}, checkpoint_path)
+    payload = {
+        "metrics": metrics or {"loss_last": 0.0},
+        "checkpoint": checkpoint_path,
+    } if runtime.is_rank0 else None
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage1 payload broadcast failed")
     barrier_if_distributed()
-    return StageMetrics("P1_PRETRAIN", int(steps), metrics or {"loss_last": 0.0}, checkpoint_path)
+    return StageMetrics("P1_PRETRAIN", int(steps), payload["metrics"], payload["checkpoint"])
 
 
 def _game_state_from_record(rec: dict[str, Any]) -> GameState:
@@ -477,7 +553,7 @@ def run_stage3_sft(
                 source_counts[src] += 1
         step_indices = list(range(int(steps)))
         for step in step_indices:
-            start = (step * batch_size) % len(dataset)
+            start = (_ranked_step(step, runtime) * int(batch_size)) % len(dataset)
             window = [dataset[(start + i) % len(dataset)] for i in range(batch_size)]
             states = [_game_state_from_record(s["state"]) for s in window]
             all_states.extend(states)
@@ -513,7 +589,12 @@ def run_stage3_sft(
                 )
     else:
         for step in range(int(steps)):
-            states = sample_reachable_states(batch_size, n=n_cards, step=step, seed=1)
+            states = sample_reachable_states(
+                batch_size,
+                n=n_cards,
+                step=_ranked_step(step, runtime),
+                seed=int(seed),
+            )
             all_states.extend(states)
             batch = public_state_from_game(states, max_cards=13, device=device)
             target_q, mask = _immediate_target(states, 13)
@@ -552,12 +633,13 @@ def run_stage3_sft(
     }
     for src in ROBUST_TEACHER_SOURCES:
         metrics[f"sft_source_{src.lower()}_samples"] = float(source_counts[src])
-    metrics.update(coverage_report(all_states).as_metrics())
+    global_states = _global_state_list(all_states, runtime)
+    metrics.update(coverage_report(global_states).as_metrics())
     if runtime.is_rank0:
         out_dir = Path(out_dir)
         ckpt = out_dir / "stage3_sft.pt"
-        if all_states:
-            _write_coverage_artifact(out_dir, "stage3_sft", all_states)
+        if global_states:
+            _write_coverage_artifact(out_dir, "stage3_sft", global_states)
         manifest = save_checkpoint(
             ckpt,
             model=getattr(model, "module", model),
@@ -567,7 +649,17 @@ def run_stage3_sft(
                 training_stage="P3_STRATEGIC_SFT",
                 global_step=int(steps),
                 policy_version=1,
-                config={"steps": steps, "batch_size": batch_size, "n_cards": n_cards, "lr": lr, "seed": seed, "world_size": runtime.world_size},
+                config={
+                    "steps": steps,
+                    "batch_size": batch_size,
+                    "local_batch_size": batch_size,
+                    "global_batch_size": int(batch_size) * int(runtime.world_size),
+                    "n_cards": n_cards,
+                    "lr": lr,
+                    "seed": seed,
+                    "world_size": runtime.world_size,
+                    "ddp_data_semantics": "rank_sharded_teacher_dataset_or_reachable_states",
+                },
                 metrics=metrics,
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
@@ -591,8 +683,15 @@ def run_stage3_sft(
         checkpoint_path = manifest["path"]
         if logger is not None:
             logger.checkpoint_saved("stage3_sft", checkpoint_path, global_step=int(steps))
+    payload = {
+        "metrics": metrics,
+        "checkpoint": checkpoint_path,
+    } if runtime.is_rank0 else None
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage3 payload broadcast failed")
     barrier_if_distributed()
-    return StageMetrics("P3_STRATEGIC_SFT", int(steps), metrics, checkpoint_path)
+    return StageMetrics("P3_STRATEGIC_SFT", int(steps), payload["metrics"], payload["checkpoint"])
 
 
 def run_stage2_semi_supervised(
@@ -600,6 +699,7 @@ def run_stage2_semi_supervised(
     steps: int,
     out_dir: str | Path,
     n_cards: int = 5,
+    seed: int = 1,
 ) -> StageMetrics:
     """Generate the multi-source robust teacher dataset consumed by P3.
 
@@ -611,16 +711,37 @@ def run_stage2_semi_supervised(
     """
     from goofspiel.training.teacher_dataset import ROBUST_TEACHER_SOURCES, build_teacher_dataset
 
-    store = JsonlStore(Path(out_dir) / "teacher_dataset.jsonl")
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed("auto")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("stage2 payload broadcast failed")
+        barrier_if_distributed()
+        return StageMetrics("P2_SEMI_SUPERVISED", int(steps), payload["metrics"], None)
+
+    path = Path(out_dir) / "teacher_dataset.jsonl"
+    path.unlink(missing_ok=True)
+    store = JsonlStore(path)
     states: list[GameState] = []
     for step in range(int(steps)):
-        states.extend(sample_reachable_states(max(8, n_cards * 2), n=n_cards, step=step, seed=1))
+        states.extend(sample_reachable_states(max(8, n_cards * 2), n=n_cards, step=step, seed=int(seed)))
     counts = build_teacher_dataset(states, store)
     total = sum(counts.values())
     metrics = {f"teacher_source_{src.lower()}_samples": float(counts[src]) for src in ROBUST_TEACHER_SOURCES}
     metrics["teacher_samples"] = float(total)
-    metrics["distinct_teacher_sources"] = float(len({v for v in counts.values() if v > 0}))
-    return StageMetrics("P2_SEMI_SUPERVISED", int(steps), metrics, None)
+    metrics["distinct_teacher_sources"] = float(sum(1 for v in counts.values() if v > 0))
+    metrics["teacher_dataset_rows"] = float(store.count())
+    metrics["seed"] = float(seed)
+    metrics["stage2_rank_owner"] = 0.0
+    metrics["stage2_write_once"] = 1.0
+    payload = {"metrics": metrics}
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage2 payload broadcast failed")
+    barrier_if_distributed()
+    return StageMetrics("P2_SEMI_SUPERVISED", int(steps), payload["metrics"], None)
 
 
 def _mirrored_state(state: GameState) -> GameState:
@@ -869,8 +990,13 @@ def run_stage4_robust_rl(
             device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
             static_graph=True,
         )
-    replay_buffer = TrajectoryReplayBuffer(Path(out_dir) / "replay" / "selfplay_robust.jsonl")
-    event_sink = JsonlEventSink(Path(out_dir) / "events" / "stage4_robust_rl.jsonl") if runtime.is_rank0 else None
+    replay_path = Path(out_dir) / "replay" / "selfplay_robust.jsonl"
+    event_path = Path(out_dir) / "events" / "stage4_robust_rl.jsonl"
+    if runtime.is_rank0 and not resume_checkpoint:
+        replay_path.unlink(missing_ok=True)
+        event_path.unlink(missing_ok=True)
+    replay_buffer = TrajectoryReplayBuffer(replay_path)
+    event_sink = JsonlEventSink(event_path) if runtime.is_rank0 else None
     warmup_n = n_cards if int(steps) <= 1 else min(3, n_cards)
     curriculum = ProgressiveCurriculum(
         target_n=n_cards,
@@ -891,8 +1017,9 @@ def run_stage4_robust_rl(
     global_trajectories_total = 0
     global_transitions_total = 0
     curriculum_path = Path(out_dir) / "curriculum" / "stage4_manifest.json"
-    curriculum_path.parent.mkdir(parents=True, exist_ok=True)
-    curriculum_path.write_text(json.dumps(curriculum.manifest(steps=int(steps)), indent=2, ensure_ascii=False), encoding="utf-8")
+    if runtime.is_rank0:
+        curriculum_path.parent.mkdir(parents=True, exist_ok=True)
+        curriculum_path.write_text(json.dumps(curriculum.manifest(steps=int(steps)), indent=2, ensure_ascii=False), encoding="utf-8")
     for step in range(int(steps)):
         cstep = curriculum.at(step)
         collector = getattr(model, "module", model)
@@ -1312,6 +1439,7 @@ def run_stage5_adaptive(
     out_dir: str | Path,
     n_cards: int = 5,
     lr: float = 3e-4,
+    seed: int = 1,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
     logger: "TrainingLogger | None" = None,
@@ -1326,7 +1454,7 @@ def run_stage5_adaptive(
     torch, F = _torch_import()
     from goofspiel.models import GoofspielModel
 
-    runtime, _ = setup_torch_distributed("cpu")
+    runtime, _ = setup_torch_distributed("auto")
     if not runtime.is_rank0:
         payload = broadcast_object(None, src=0)
         if payload is None:
@@ -1336,9 +1464,11 @@ def run_stage5_adaptive(
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    seed = 503 + int(steps) + int(n_cards)
-    rng = random.Random(seed)
+    stage_seed = int(seed) + 503 + int(steps) + int(n_cards)
+    rng = random.Random(stage_seed)
     sessions_path = out / "adaptive" / "opponent_sessions.jsonl"
+    if not resume_checkpoint:
+        sessions_path.unlink(missing_ok=True)
     sessions = JsonlStore(sessions_path)
     session_rows = []
     regimes = default_opponent_curriculum()
@@ -1377,7 +1507,7 @@ def run_stage5_adaptive(
                 state = result.state
             games.append(rounds)
         session = OpponentSession(
-            session_id=f"adaptive_session_{session_idx}:seed{seed}:n{n_cards}",
+            session_id=f"adaptive_session_{session_idx}:seed{stage_seed}:n{n_cards}",
             opponent_id=f"curriculum_{regime.regime_id}",
             strategy_regime_id=regime.regime_id,
             games=games,
@@ -1456,7 +1586,7 @@ def run_stage5_adaptive(
             training_stage="P5_ADAPTIVE",
             global_step=train_steps,
             policy_version=3,
-            config={"steps": steps, "n_cards": n_cards, "lr": lr, "games_per_session": games_per_session, "seed": seed},
+            config={"steps": steps, "n_cards": n_cards, "lr": lr, "games_per_session": games_per_session, "seed": seed, "stage_seed": stage_seed},
             metrics={
                 "opponent_nll": last["nll"],
                 "uniform_reference_nll": uniform_reference_nll,
@@ -1529,6 +1659,8 @@ def run_stage5_adaptive(
         raise RuntimeError("stage5 payload broadcast failed")
     barrier_if_distributed()
     return StageMetrics("P5_ADAPTIVE", int(steps), payload["metrics"], payload["checkpoint"])
+
+
 def _sample_from_policy(policy: list[float], legal: list[int], rng: random.Random) -> int:
     weights = [max(0.0, float(policy[card - 1])) for card in legal]
     total = sum(weights)
@@ -1586,6 +1718,7 @@ def _mint_league_snapshot(role: str, *, out_dir: Path, seed: int, n_cards: int =
         n_cards=n_cards,
         lr=3e-4,
         seed=seed,
+        local_only=True,
     )
     return metrics.checkpoint
 
@@ -1608,9 +1741,22 @@ def run_stage6_league(
     out_dir: str | Path,
     role_checkpoints: dict[str, str | Path] | None = None,
     n_cards: int = 3,
+    seed: int = 1,
 ) -> StageMetrics:
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed("auto")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("stage6 payload broadcast failed")
+        barrier_if_distributed()
+        return StageMetrics("P6_LEAGUE", 1, payload["metrics"], payload.get("checkpoint"))
+
     out = Path(out_dir)
-    registry = LeagueRegistry(out / "league" / "registry.json")
+    registry_path = out / "league" / "registry.json"
+    registry_path.unlink(missing_ok=True)
+    registry = LeagueRegistry(registry_path)
 
     # Phase 4.3: every league agent must reference a REAL, loadable checkpoint.
     # A caller (the smoke pipeline) can supply per-role checkpoints; otherwise we
@@ -1650,7 +1796,7 @@ def run_stage6_league(
                 policies[row_agent.agent_id],
                 policies[col_agent.agent_id],
                 n_cards=n_cards,
-                seed=len(cross_play) + 600,
+                seed=int(seed) + len(cross_play) + 600,
             )
             cross_play.append(
                 {
@@ -1679,7 +1825,10 @@ def run_stage6_league(
     for agent in agents:
         ref = reference_by_role[agent.role]
         score = _play_policy_match(
-            policies[agent.agent_id], ref, n_cards=n_cards, seed=len(reference_play) + 900
+            policies[agent.agent_id],
+            ref,
+            n_cards=n_cards,
+            seed=int(seed) + len(reference_play) + 900,
         )
         reference_play.append(
             {
@@ -1711,6 +1860,9 @@ def run_stage6_league(
         "reference_play": reference_play,
         "agent_checkpoints": {agent.agent_id: policies[agent.agent_id].checkpoint_path for agent in agents},
         "historical_agents_frozen": all(agent.frozen for agent in agents),
+        "seed": int(seed),
+        "crossplay_seed_base": int(seed) + 600,
+        "reference_seed_base": int(seed) + 900,
     }
     report_path = out / "league" / "league_report.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1722,9 +1874,16 @@ def run_stage6_league(
             "crossplay_pairs": float(len(cross_play)),
             "pfsp_weights": float(len(pfsp_weights)),
             "reference_matches": float(len(reference_play)),
+            "stage6_rank_owner": 0.0,
+            "stage6_write_once": 1.0,
         }
     )
-    return StageMetrics("P6_LEAGUE", 1, metrics, None)
+    payload = {"metrics": metrics, "checkpoint": None}
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage6 payload broadcast failed")
+    barrier_if_distributed()
+    return StageMetrics("P6_LEAGUE", 1, payload["metrics"], payload.get("checkpoint"))
 
 
 def _attack_state_regression(
@@ -1773,10 +1932,25 @@ def run_stage7_redteam(
     correction_steps: int = 40,
     lr: float = 1e-3,
     n_cards: int = 3,
+    seed: int = 1,
 ) -> StageMetrics:
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed("auto")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("stage7 payload broadcast failed")
+        barrier_if_distributed()
+        return StageMetrics("P7_REDTEAM", 1, payload["metrics"], payload["checkpoint"])
+
     out = Path(out_dir)
-    failures = FailureBuffer(out / "redteam" / "failures.jsonl")
-    corrections = CorrectionDataset(out / "redteam" / "corrections.jsonl")
+    failures_path = out / "redteam" / "failures.jsonl"
+    corrections_path = out / "redteam" / "corrections.jsonl"
+    failures_path.unlink(missing_ok=True)
+    corrections_path.unlink(missing_ok=True)
+    failures = FailureBuffer(failures_path)
+    corrections = CorrectionDataset(corrections_path)
     router = TeacherRouter()
     attack_states = [
         GameState.initial(3, current_prize=1),
@@ -1795,7 +1969,7 @@ def run_stage7_redteam(
         best_index = max(range(len(state.self_actions)), key=lambda i: pol[i])
         teacher_cards.append(state.self_actions[best_index])
         failure = FailureRecord(
-            failure_id=f"redteam_attack_{idx}_{uuid.uuid4().hex}",
+            failure_id=f"redteam_attack_{idx}_seed{int(seed)}_n{n_cards}",
             failure_type="ADVERSARIAL_STATE_REANALYSIS",
             state=state_record_from_game_state(state),
             model_version="seed_initial",
@@ -1809,7 +1983,7 @@ def run_stage7_redteam(
         failures.add(failure)
         corrections.add_reanalysis(
             ReanalysisRecord(
-                sample_id=f"correction_{idx}_{uuid.uuid4().hex}",
+                sample_id=f"correction_{idx}_seed{int(seed)}_n{n_cards}",
                 original_sample_id=failure.failure_id,
                 state=failure.state,
                 new_teacher_source=sample.teacher_source,
@@ -1839,7 +2013,7 @@ def run_stage7_redteam(
 
     if not init_from_checkpoint or not Path(init_from_checkpoint).exists():
         seed_metrics = run_stage1_pretrain(
-            steps=1, batch_size=4, out_dir=out / "redteam" / "seed", n_cards=n_cards
+            steps=1, batch_size=4, out_dir=out / "redteam" / "seed", n_cards=n_cards, local_only=True
         )
         init_from_checkpoint = seed_metrics.checkpoint
 
@@ -1884,7 +2058,7 @@ def run_stage7_redteam(
             training_stage="P7_REDTEAM",
             global_step=int(correction_steps),
             policy_version=4,
-            config={"correction_steps": correction_steps, "lr": lr, "n_cards": n_cards},
+            config={"correction_steps": correction_steps, "lr": lr, "n_cards": n_cards, "seed": seed},
             metrics={"focused_correction_loss_last": last_loss},
             parent_checkpoint_id="seed_initial",
             init_checkpoint_id=str(init_from_checkpoint),
@@ -1936,7 +2110,7 @@ def run_stage7_redteam(
         ),
         encoding="utf-8",
     )
-    return StageMetrics(
+    metrics = StageMetrics(
         "P7_REDTEAM",
         1,
         {
@@ -1953,15 +2127,39 @@ def run_stage7_redteam(
             "mean_teacher_nll_after": regression_after["mean_teacher_nll"],
             "original_attack_regression_passed": float(original_attack_regression_passed),
             "general_regression_passed": float(general_regression_passed),
+            "stage7_rank_owner": 0.0,
+            "stage7_write_once": 1.0,
         },
         str(corrected_ckpt),
     )
+    payload = {"metrics": metrics.metrics, "checkpoint": metrics.checkpoint}
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("stage7 payload broadcast failed")
+    barrier_if_distributed()
+    return StageMetrics("P7_REDTEAM", 1, payload["metrics"], payload["checkpoint"])
 
 
-def run_evaluation_suite(*, out_dir: str | Path, num_games: int = 16, checkpoint: str | None = None) -> dict[str, Any]:
+def run_evaluation_suite(
+    *,
+    out_dir: str | Path,
+    num_games: int = 16,
+    checkpoint: str | None = None,
+    seed: int = 1,
+) -> dict[str, Any]:
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed("auto")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("evaluation payload broadcast failed")
+        barrier_if_distributed()
+        return payload
+
     from goofspiel.training.benchmark import EvaluationProfile, run_unified_benchmark, write_benchmark_report
 
-    report_a = evaluate_bot_matchup(num_games=num_games)
+    report_a = evaluate_bot_matchup(num_games=num_games, seed=int(seed))
     report_b = exact_feasibility_sweep(13)
     path = Path(out_dir) / "evaluation_report.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1976,9 +2174,21 @@ def run_evaluation_suite(*, out_dir: str | Path, num_games: int = 16, checkpoint
     # REAL play vs Random when a checkpoint is supplied (never the Heuristic-vs-
     # Random reference), and G2 becomes a real robustness verdict on it.
     benchmark = run_unified_benchmark(
-        EvaluationProfile(name="QUICK", num_games=num_games, include_e7=False), checkpoint=checkpoint
+        EvaluationProfile(
+            name="QUICK",
+            seeds=[int(seed) + i for i in range(3)],
+            num_games=num_games,
+            include_e7=False,
+        ),
+        checkpoint=checkpoint,
     )
     payload["benchmark_report"] = write_benchmark_report(benchmark, Path(out_dir) / "reports" / "quick")
+    payload["rank_owner"] = 0
+    payload["write_once"] = True
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("evaluation payload broadcast failed")
+    barrier_if_distributed()
     return payload
 
 
@@ -2004,10 +2214,25 @@ def run_axis_promotion_selection(
     """
     from goofspiel.training.selection import select_checkpoints_by_axis
 
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed("auto")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("axis selection payload broadcast failed")
+        barrier_if_distributed()
+        return payload
+
     out = Path(out_dir)
     existing = {cid: path for cid, path in candidates.items() if path and Path(path).exists()}
     if not existing:
-        return {"selected": {}, "table": {}, "reason": "no_candidate_checkpoints"}
+        payload = {"selected": {}, "table": {}, "reason": "no_candidate_checkpoints", "rank_owner": 0, "write_once": True}
+        payload = broadcast_object(payload, src=0)
+        if payload is None:
+            raise RuntimeError("axis selection payload broadcast failed")
+        barrier_if_distributed()
+        return payload
 
     selection = select_checkpoints_by_axis(
         existing,
@@ -2049,10 +2274,16 @@ def run_axis_promotion_selection(
         "table": selection.table,
         "distinct_winner_count": selection.distinct_winner_count(),
         "candidates": {cid: str(path) for cid, path in existing.items()},
+        "rank_owner": 0,
+        "write_once": True,
     }
     report_path = out / "reports" / "axis_selection.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    report = broadcast_object(report, src=0)
+    if report is None:
+        raise RuntimeError("axis selection payload broadcast failed")
+    barrier_if_distributed()
     return report
 
 
@@ -2105,12 +2336,22 @@ def run_smoke_pipeline(
     seed: int = 1,
 ) -> dict[str, Any]:
     """Run the smallest end-to-end training flow that still writes real artifacts."""
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed(device)
+
     out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    sink = JsonlEventSink(out / "events" / "training_smoke.jsonl")
+    event_path = out / "events" / "training_smoke.jsonl"
+    if runtime.is_rank0:
+        out.mkdir(parents=True, exist_ok=True)
+        event_path.unlink(missing_ok=True)
+        sink = JsonlEventSink(event_path)
+    else:
+        sink = None
 
     def emit(stage: str, payload: dict[str, Any]) -> None:
-        sink.emit(BaseEvent(event_type="TRAINING_SMOKE_STAGE", run_id="smoke_pipeline", payload={"stage": stage, **payload}))
+        if sink is not None:
+            sink.emit(BaseEvent(event_type="TRAINING_SMOKE_STAGE", run_id="smoke_pipeline", payload={"stage": stage, **payload}))
 
     emit("system_metrics_start", collect_system_metrics())
     stage0 = run_stage0_verify(artifact_dir=out / "stage0_verify")
@@ -2119,25 +2360,29 @@ def run_smoke_pipeline(
     emit("build_corpus", {"ok": True, "metrics": corpus})
     stage1 = run_stage1_pretrain(
         steps=steps, batch_size=batch_size, out_dir=out / "checkpoints", device=device, n_cards=n_cards,
+        seed=seed,
         corpus_path=out / "data" / "game_corpus.jsonl",
     )
     emit("stage1_pretrain", {"ok": True, "metrics": stage1.metrics, "checkpoint": stage1.checkpoint})
-    stage2 = run_stage2_semi_supervised(steps=steps, out_dir=out / "data", n_cards=n_cards)
+    stage2 = run_stage2_semi_supervised(steps=steps, out_dir=out / "data", n_cards=n_cards, seed=seed)
     emit("stage2_semi_supervised", {"ok": True, "metrics": stage2.metrics})
     # Phase 3.1: chain theta forward. P3 inherits P1's weights (theta-only, fresh
     # optimizer); P4 inherits P3's. This is init_from_checkpoint, NOT resume.
     stage3 = run_stage3_sft(
         steps=steps, batch_size=batch_size, out_dir=out / "checkpoints", device=device, n_cards=n_cards,
+        seed=seed,
         init_from_checkpoint=stage1.checkpoint,
     )
     emit("stage3_sft", {"ok": True, "metrics": stage3.metrics, "checkpoint": stage3.checkpoint})
     stage4 = run_stage4_robust_rl(
         steps=steps, batch_size=batch_size, out_dir=out / "checkpoints", device=device, n_cards=n_cards,
+        seed=seed,
         init_from_checkpoint=stage3.checkpoint,
     )
     emit("stage4_robust_rl", {"ok": True, "metrics": stage4.metrics, "checkpoint": stage4.checkpoint})
     stage5 = run_stage5_adaptive(
         steps=steps, out_dir=out, n_cards=n_cards,
+        seed=seed,
         init_from_checkpoint=stage4.checkpoint,
     )
     emit("stage5_adaptive", {"ok": True, "metrics": stage5.metrics, "checkpoint": stage5.checkpoint})
@@ -2152,14 +2397,15 @@ def run_smoke_pipeline(
             ROLE_EXPLOITER: stage5.checkpoint,
         },
         n_cards=n_cards,
+        seed=seed,
     )
     emit("stage6_league", {"ok": True, "metrics": stage6.metrics})
     # Phase 4.4: P7 focuses a REAL correction fine-tune on the P4 robust backbone
     # and MEASURES the attack-state regression before/after.
-    stage7 = run_stage7_redteam(out_dir=out, init_from_checkpoint=stage4.checkpoint, n_cards=n_cards)
+    stage7 = run_stage7_redteam(out_dir=out, init_from_checkpoint=stage4.checkpoint, n_cards=n_cards, seed=seed)
     emit("stage7_redteam", {"ok": True, "metrics": stage7.metrics})
     evaluation = run_evaluation_suite(
-        out_dir=out / "evaluation", num_games=max(2, num_corpus_games), checkpoint=stage4.checkpoint
+        out_dir=out / "evaluation", num_games=max(2, num_corpus_games), checkpoint=stage4.checkpoint, seed=seed
     )
     emit("evaluate", {"ok": True, "metrics": evaluation})
 
@@ -2202,8 +2448,8 @@ def run_smoke_pipeline(
         "steps": int(steps),
         "batch_size": int(batch_size),
         "num_corpus_games": int(num_corpus_games),
-        "event_log": str(sink.path),
-        "event_count": sink.count(),
+        "event_log": str(event_path),
+        "event_count": sink.count() if sink is not None else 0,
         "stage0": {"ok": stage0.ok, "checks": stage0.checks, "errors": stage0.errors},
         "build_corpus": corpus,
         "stage1_pretrain": as_stage_dict(stage1),
@@ -2216,9 +2462,14 @@ def run_smoke_pipeline(
         "evaluation": evaluation,
     }
     summary_path = out / "training_smoke_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    if runtime.is_rank0:
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     summary["summary_path"] = str(summary_path)
-    return summary
+    payload = broadcast_object(summary if runtime.is_rank0 else None, src=0)
+    if payload is None:
+        raise RuntimeError("smoke pipeline payload broadcast failed")
+    barrier_if_distributed()
+    return payload
 
 
 def as_stage_dict(metrics: StageMetrics) -> dict[str, Any]:

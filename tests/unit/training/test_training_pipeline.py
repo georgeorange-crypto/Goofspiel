@@ -377,7 +377,12 @@ def test_stage6_league_plays_real_distinct_checkpoints(tmp_path: Path):
     row = rows[0]
     row_pol = _CheckpointPolicy(row["row_checkpoint"], temperature=0.5)
     col_pol = _CheckpointPolicy(row["col_checkpoint"], temperature=0.5)
-    replayed = _play_policy_match(row_pol, col_pol, n_cards=3, seed=600)  # first row -> seed 600
+    replayed = _play_policy_match(
+        row_pol,
+        col_pol,
+        n_cards=3,
+        seed=int(report["crossplay_seed_base"]),
+    )
     assert replayed == pytest.approx(row["mean_score_diff"]), "cross-play row is not reproducible model play"
 
     # Handcrafted baselines survive ONLY as a clearly-labelled reference block.

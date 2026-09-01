@@ -8,6 +8,7 @@ from pathlib import Path
 from goofspiel.env import PLAYER_0, PLAYER_1, GoofspielEnv
 from goofspiel.game import state_from_env
 from goofspiel.training.data import GameCorpusSample, JsonlStore, RoundRecord, state_record_from_game_state
+from goofspiel.training.distributed import barrier_if_distributed, broadcast_object, current_runtime, setup_torch_distributed
 
 
 def generate_random_game_corpus(
@@ -17,9 +18,23 @@ def generate_random_game_corpus(
     n_min: int = 3,
     n_max: int = 13,
     seed: int = 1,
+    append: bool = False,
 ) -> dict[str, int]:
+    runtime = current_runtime()
+    if runtime.is_distributed:
+        runtime, _ = setup_torch_distributed("auto")
+    if not runtime.is_rank0:
+        payload = broadcast_object(None, src=0)
+        if payload is None:
+            raise RuntimeError("corpus payload broadcast failed")
+        barrier_if_distributed()
+        return payload
+
     rng = random.Random(seed)
-    store = JsonlStore(out_path)
+    path = Path(out_path)
+    if not append:
+        path.unlink(missing_ok=True)
+    store = JsonlStore(path)
     written = 0
     for game_idx in range(num_games):
         n = rng.randint(n_min, n_max)
@@ -54,4 +69,9 @@ def generate_random_game_corpus(
                 )
             )
             written += 1
-    return {"games": int(num_games), "samples": written}
+    payload = {"games": int(num_games), "samples": written, "rank_owner": 0, "append": int(bool(append))}
+    payload = broadcast_object(payload, src=0)
+    if payload is None:
+        raise RuntimeError("corpus payload broadcast failed")
+    barrier_if_distributed()
+    return payload

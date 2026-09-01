@@ -149,6 +149,11 @@ def setup_torch_distributed(device: str = "cpu") -> tuple[DistributedRuntime, st
         import torch
         import torch.distributed as dist
 
+        if device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
         if device.startswith("cuda"):
             torch.cuda.set_device(runtime.local_rank)
             resolved_device = f"cuda:{runtime.local_rank}"

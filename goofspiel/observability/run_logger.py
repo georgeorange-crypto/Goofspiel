@@ -73,6 +73,8 @@ class TrainingLogger:
             return
 
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.run_log_path.unlink(missing_ok=True)
+        self.event_log_path.unlink(missing_ok=True)
         self._sink = JsonlEventSink(self.event_log_path)
 
         logger = logging.getLogger(_LOGGER_NAME)

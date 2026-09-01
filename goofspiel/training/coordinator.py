@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .corpus import generate_random_game_corpus
-from .distributed import STAGE_SEQUENCE, current_runtime
+from .distributed import STAGE_SEQUENCE, broadcast_object, current_runtime, barrier_if_distributed
 from .league import ROLE_AGGRESSIVE, ROLE_EXPLOITER, ROLE_ROBUST
 from ..observability import TrainingLogger
 from .stage0_verify import run_stage0_verify
@@ -237,6 +237,7 @@ class TrainingCoordinator:
                 steps=self.config.steps,
                 out_dir=self.artifact_dir / "data",
                 n_cards=self.config.n_cards,
+                seed=self.config.seed,
             )
             return {"stage": stage, "ok": True, "metrics": asdict(metrics)}
         if stage == "stage3_sft":
@@ -270,6 +271,7 @@ class TrainingCoordinator:
                 steps=self.config.steps,
                 out_dir=self.artifact_dir,
                 n_cards=self.config.n_cards,
+                seed=self.config.seed,
                 init_from_checkpoint=init_from_checkpoint,
                 resume_checkpoint=resume,
                 logger=self.logger,
@@ -308,6 +310,7 @@ class TrainingCoordinator:
                 out_dir=self.artifact_dir,
                 role_checkpoints=role_checkpoints or None,
                 n_cards=self.config.n_cards,
+                seed=self.config.seed,
             )
             result = {"stage": stage, "ok": True, "metrics": asdict(metrics)}
             result["role_checkpoints"] = role_checkpoints
@@ -326,6 +329,7 @@ class TrainingCoordinator:
                 out_dir=self.artifact_dir,
                 init_from_checkpoint=init_p4,
                 n_cards=self.config.n_cards,
+                seed=self.config.seed,
             )
             result = {"stage": stage, "ok": True, "metrics": asdict(metrics)}
             result["init_from_checkpoint"] = init_p4
@@ -343,7 +347,7 @@ class TrainingCoordinator:
             else:
                 eval_ckpt = self._resolve_checkpoint("stage4_robust_rl", produced)
             payload = run_evaluation_suite(
-                out_dir=self.artifact_dir, num_games=16, checkpoint=eval_ckpt
+                out_dir=self.artifact_dir, num_games=16, checkpoint=eval_ckpt, seed=self.config.seed
             )
             result = {"stage": stage, "ok": True, "metrics": payload}
             result["evaluated_checkpoint"] = eval_ckpt
@@ -566,23 +570,29 @@ class TrainingCoordinator:
             "axis_selection": axis_selection,
             "artifact_dir": str(self.artifact_dir),
         }
+        runtime = current_runtime()
 
         # Priority ⑥: assemble THIS run's checkpoints into a lineage tree and
         # record whether it is internally consistent — every child descends from
         # the parent it names, that parent file is unchanged since the child
         # inherited, and the architecture is stable across every edge.  Computed
         # by re-hashing on disk, not by trusting a flag.
-        from .lineage import build_lineage_from_run
+        if runtime.is_rank0:
+            from .lineage import build_lineage_from_run
 
-        tree = build_lineage_from_run(self.artifact_dir)
-        summary["lineage_consistent"] = tree.is_consistent()
-        summary["lineage_inconsistencies"] = tree.inconsistencies()
-        summary["lineage_order"] = tree.chain_order()
-        logger.lineage_verdict(
-            tree.is_consistent(),
-            inconsistencies=tree.inconsistencies(),
-            order=tree.chain_order(),
-        )
+            tree = build_lineage_from_run(self.artifact_dir)
+            summary["lineage_consistent"] = tree.is_consistent()
+            summary["lineage_inconsistencies"] = tree.inconsistencies()
+            summary["lineage_order"] = tree.chain_order()
+            logger.lineage_verdict(
+                tree.is_consistent(),
+                inconsistencies=tree.inconsistencies(),
+                order=tree.chain_order(),
+            )
+        else:
+            summary["lineage_consistent"] = None
+            summary["lineage_inconsistencies"] = []
+            summary["lineage_order"] = []
 
         # Surface the two log products on the summary, mirroring smoke's
         # event_log/event_count convention, so a run's observability outputs are
@@ -591,10 +601,15 @@ class TrainingCoordinator:
         summary["event_log"] = str(logger.event_log_path)
         summary["event_count"] = logger.event_count
 
-        (self.artifact_dir / "full_sequence_summary.json").write_text(
-            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        if runtime.is_rank0:
+            (self.artifact_dir / "full_sequence_summary.json").write_text(
+                json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
         logger.system_metrics("run_end")
         logger.run_end(summary)
         logger.close()
-        return summary
+        payload = broadcast_object(summary if runtime.is_rank0 else None, src=0)
+        if payload is None:
+            raise RuntimeError("full sequence summary broadcast failed")
+        barrier_if_distributed()
+        return payload

@@ -202,16 +202,19 @@ def run_stage1_pretrain(
     runtime, device = setup_torch_distributed(device)
     model = GoofspielModel(max_cards=13).to(device)
     if runtime.is_distributed:
-        # GoofspielModel is multi-branch (robust + adaptive/opponent heads); a
-        # single stage's loss exercises only some branches, so the others produce
-        # no grad this iteration.  Default DDP forbids that and aborts on step 1
-        # ("Expected to have finished reduction..."); find_unused_parameters lets
-        # the reducer skip the idle params instead.  Required for correctness
-        # here, not a perf knob.
+        # stage1 runs TWO forward passes (batch + swapped_batch) into a SINGLE
+        # backward (swap_loss / style_loss span both).  find_unused_parameters is
+        # documented NOT to support multiple-forward-before-one-backward and aborts
+        # with "Expected to have finished reduction in the prior iteration..." even
+        # once it is enabled.  static_graph=True is the primitive built for this:
+        # it traces the autograd graph on the first iteration and reuses it, which
+        # also transparently handles the multi-branch model's idle params (the
+        # per-stage loss is fixed, so the used-param set is stable across steps —
+        # static_graph's precondition).  Required for correctness, not a perf knob.
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
-            find_unused_parameters=True,
+            static_graph=True,
         )
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     lineage = _apply_init_or_resume(

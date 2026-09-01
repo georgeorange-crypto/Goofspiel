@@ -150,8 +150,10 @@ def test_missing_parent_checkpoint_raises_not_silent(tmp_path, monkeypatch):
 
     real_dispatch = coord_mod.TrainingCoordinator._dispatch_stage
 
-    def sabotaged(self, stage, *, init_from_checkpoint):
-        out = real_dispatch(self, stage, init_from_checkpoint=init_from_checkpoint)
+    def sabotaged(self, stage, *, init_from_checkpoint, produced=None, strict=False):
+        out = real_dispatch(
+            self, stage, init_from_checkpoint=init_from_checkpoint, produced=produced, strict=strict
+        )
         if stage == "stage1_pretrain":
             # Simulate a checkpoint-write failure: metrics carry no checkpoint.
             out["metrics"]["checkpoint"] = None

@@ -178,6 +178,11 @@ class HeuristicBot(BaseBot):
 
     def __init__(self, rng: Optional[Rng] = None) -> None:
         super().__init__(rng=rng)
+        # Per-instance seeded numpy Generator so the neighbour-sampling below is
+        # reproducible from ``self._rng`` — using the global ``np.random`` here
+        # would make every match non-deterministic even under a fixed seed
+        # (same bug NashBot already avoids via its own ``_np_rng``).
+        self._np_rng = np.random.default_rng(self._rng.randint(0, 2**31 - 1))
 
     def _choose(
         self, env: GoofspielEnv, player: PlayerId,
@@ -305,7 +310,7 @@ class HeuristicBot(BaseBot):
         weights = weights / weights.sum()
 
         # Sample
-        chosen_idx = int(np.random.choice(len(legal), p=weights))
+        chosen_idx = int(self._np_rng.choice(len(legal), p=weights))
         action = legal[chosen_idx]
 
         dist = [[c, float(weights[i] * 100.0)] for i, c in enumerate(legal)]

@@ -447,4 +447,74 @@ __all__ = [
     "one_step_matrix_nash_gap",
     "evaluate_checkpoint",
     "CheckpointEvaluation",
+    "capability_retention",
+    "CapabilityRetention",
 ]
+
+
+# ======================================================================
+# ⑤ Capability retention — did a later stage forget what an earlier one knew?
+# ======================================================================
+@dataclass
+class CapabilityRetention:
+    """Per-capability before/after comparison between a parent and its child.
+
+    ``retained`` is the AND over each probed capability's non-regression; the
+    ``deltas`` map carries the raw (parent, child, delta) for every capability so
+    a failure says exactly which ability collapsed and by how much.
+    """
+    parent_checkpoint: str
+    child_checkpoint: str
+    deltas: dict[str, dict[str, float]] = field(default_factory=dict)
+    regressions: list[str] = field(default_factory=list)
+
+    @property
+    def retained(self) -> bool:
+        return not self.regressions
+
+
+def capability_retention(
+    parent_path: str | Path,
+    child_path: str | Path,
+    *,
+    device: str = "cpu",
+    n_cards: tuple[int, ...] = (5,),
+    num_games: int = 32,
+    seed: int = 1,
+    opponents: tuple[str, ...] = ("random", "heuristic"),
+    win_rate_tolerance: float = 0.10,
+) -> CapabilityRetention:
+    """Detect catastrophic forgetting from ``parent`` to ``child``.
+
+    Both checkpoints are probed on the SAME capabilities through the honest
+    harness (win-rate vs each bot, per N).  A capability has *regressed* when the
+    child's win-rate falls more than ``win_rate_tolerance`` below the parent's —
+    a real drop in a demonstrated ability, not sampling noise.  Every number is
+    freshly played here; nothing is read from a stored metric.
+
+    The tolerance exists because a later stage legitimately trades a little
+    vs-Random win-rate for robustness elsewhere; the check flags a COLLAPSE, not
+    every downward wobble.  ``retained`` is the AND over all probed capabilities.
+    """
+    parent_model, _ = load_model_from_checkpoint(parent_path, device=device)
+    child_model, _ = load_model_from_checkpoint(child_path, device=device)
+    parent_policy = robust_policy_fn(parent_model, device=device, greedy=True)
+    child_policy = robust_policy_fn(child_model, device=device, greedy=True)
+
+    result = CapabilityRetention(
+        parent_checkpoint=str(parent_path), child_checkpoint=str(child_path)
+    )
+    for n in n_cards:
+        for opp in opponents:
+            cap = f"N{n}_win_rate_vs_{opp}"
+            p = play_policy_vs_bot(parent_policy, opp, n_cards=n, num_games=num_games, seed=seed)
+            c = play_policy_vs_bot(child_policy, opp, n_cards=n, num_games=num_games, seed=seed)
+            delta = c["win_rate"] - p["win_rate"]
+            result.deltas[cap] = {
+                "parent": p["win_rate"],
+                "child": c["win_rate"],
+                "delta": delta,
+            }
+            if delta < -win_rate_tolerance:
+                result.regressions.append(cap)
+    return result

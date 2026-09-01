@@ -33,9 +33,15 @@ class CheckpointMetadata:
     # ``stage4_robust ⟵ stage3_sft ⟵ stage1_pretrain``, not merely "the file exists".
     parent_checkpoint_id: str | None = None      # the checkpoint this run continued from
     init_checkpoint_id: str | None = None        # θ-only source (init_from_checkpoint)
+    parent_checkpoint_sha256: str | None = None  # sha256 of the parent FILE at inherit-time
     model_config_hash: str | None = None         # architecture (named-param shape) signature
     dataset_manifest_ids: list[str] = field(default_factory=list)
     teacher_dataset_ids: list[str] = field(default_factory=list)
+    # Structured content provenance for every dataset this stage trained on:
+    # each entry is {"path", "sha256", "num_samples", "role"}.  The sha256 is of
+    # the dataset FILE's bytes, so a silently-changed dataset is detectable —
+    # ``teacher_dataset_ids`` above records only the path, which cannot.
+    datasets: list[dict[str, Any]] = field(default_factory=list)
     optimizer_reset: bool = False                # True = fresh optimizer (stage boundary)
 
 
@@ -45,6 +51,26 @@ def sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def dataset_provenance(
+    path: str | Path, *, num_samples: int, role: str
+) -> dict[str, Any]:
+    """Content-addressed provenance for a training dataset file.
+
+    Records the file's byte-level ``sha256`` (not just its path), the sample
+    count the stage actually consumed, and the ``role`` the dataset played.  A
+    dataset whose contents change between runs produces a different sha256, so a
+    later lineage audit can catch "same path, different data" — which a path
+    string alone silently hides.
+    """
+    p = Path(path)
+    return {
+        "path": str(p),
+        "sha256": sha256_file(p) if p.exists() else None,
+        "num_samples": int(num_samples),
+        "role": role,
+    }
 
 
 def collect_rng_state() -> dict[str, Any]:

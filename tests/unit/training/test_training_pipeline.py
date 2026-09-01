@@ -345,7 +345,7 @@ def test_stage6_league_plays_real_distinct_checkpoints(tmp_path: Path):
     from goofspiel.training.stages import _CheckpointPolicy, _play_policy_match
 
     result = TrainingCoordinator(
-        TrainingRunConfig(artifact_dir=str(tmp_path / "stage6"), stage="stage6_league")
+        TrainingRunConfig(artifact_dir=str(tmp_path / "stage6"), stage="stage6_league", n_cards=3)
     ).run()
     assert result["ok"] is True
     report = json.loads((tmp_path / "stage6" / "league" / "league_report.json").read_text(encoding="utf-8"))

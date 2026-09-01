@@ -9,12 +9,16 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from goofspiel.game import GameState, legal_cards, transition
 from goofspiel.observability import BaseEvent, JsonlEventSink, collect_system_metrics
+
+if TYPE_CHECKING:
+    from goofspiel.observability import TrainingLogger
 from goofspiel.training.checkpoint import (
     CheckpointMetadata,
+    dataset_provenance,
     model_config_hash,
     save_checkpoint,
 )
@@ -57,6 +61,19 @@ def _torch_import():
             "Run `python -c \"import torch; print(torch.__version__)\"` first. "
             f"Original import error: {exc!r}"
         ) from exc
+
+
+def _should_log_step(step: int, total: int) -> bool:
+    """Log roughly ten evenly-spaced steps per stage, always including the last.
+
+    A stage running few steps (the smoke/test path) logs every step; a long run
+    logs one line per ~10% of progress so ``run.log`` stays readable while still
+    charting the loss trajectory rather than only its final value.
+    """
+    if total <= 0:
+        return True
+    every = max(1, total // 10)
+    return step % every == 0 or step == total - 1
 
 
 def _sample_states(batch_size: int, *, n: int, step: int) -> list[GameState]:
@@ -132,6 +149,7 @@ def _apply_init_or_resume(
     lineage: dict[str, Any] = {
         "parent_checkpoint_id": None,
         "init_checkpoint_id": None,
+        "parent_checkpoint_sha256": None,
         "optimizer_reset": True,
         "resumed_global_step": 0,
     }
@@ -141,6 +159,10 @@ def _apply_init_or_resume(
         lineage["init_checkpoint_id"] = prov["init_checkpoint_id"]
         lineage["parent_checkpoint_id"] = prov["init_checkpoint_id"]
         lineage["init_checkpoint_sha256"] = prov["init_checkpoint_sha256"]
+        # The parent FILE's content hash at the moment we inherited from it — the
+        # single fact a lineage-consistency check needs to confirm the child was
+        # built on THIS parent's bytes, not a same-named file that later changed.
+        lineage["parent_checkpoint_sha256"] = prov["init_checkpoint_sha256"]
         lineage["optimizer_reset"] = True  # a stage boundary always resets the optimizer
     elif resume_checkpoint_path:
         prov = _load_resume_checkpoint(
@@ -148,6 +170,7 @@ def _apply_init_or_resume(
         )
         lineage["parent_checkpoint_id"] = prov["parent_checkpoint_id"]
         lineage["resume_sha256"] = prov["resume_sha256"]
+        lineage["parent_checkpoint_sha256"] = prov["resume_sha256"]
         lineage["optimizer_reset"] = False  # a resume restores the optimizer
         lineage["resumed_global_step"] = prov["global_step"]
     return lineage
@@ -161,10 +184,18 @@ def run_stage1_pretrain(
     device: str = "cpu",
     n_cards: int = 13,
     lr: float = 3e-4,
+    corpus_path: str | Path | None = None,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
+    logger: "TrainingLogger | None" = None,
 ) -> StageMetrics:
-    """P1 pretraining over swap, transition, joint-outcome, and opponent tasks."""
+    """P1 pretraining over swap, transition, joint-outcome, and opponent tasks.
+
+    When ``corpus_path`` points at a ``game_corpus.jsonl`` (written by
+    ``build_corpus``), P1 pretrains over the states actually recorded there —
+    so the corpus is a LIVE producer feeding P1, not a dead artifact.  When it
+    is absent, P1 falls back to on-the-fly ``sample_reachable_states``.
+    """
     torch, F = _torch_import()
     from goofspiel.models import GoofspielModel, public_state_from_game
 
@@ -179,11 +210,19 @@ def run_stage1_pretrain(
         resume_checkpoint_path=resume_checkpoint,
         optimizers={"public_pretrain": opt},
     )
+    # Prefer the game corpus written by build_corpus; fall back to on-the-fly
+    # reachable states when it is absent (a stage run in isolation).
+    corpus_states = _load_corpus_states(Path(corpus_path)) if corpus_path else []
+    corpus_source = "game_corpus" if corpus_states else "sample_reachable_states"
     losses: list[float] = []
     metrics: dict[str, float] = {}
     all_states: list[GameState] = []
     for step in range(int(steps)):
-        states = sample_reachable_states(batch_size, n=n_cards, step=step, seed=1)
+        if corpus_states:
+            start = (step * batch_size) % len(corpus_states)
+            states = [corpus_states[(start + i) % len(corpus_states)] for i in range(batch_size)]
+        else:
+            states = sample_reachable_states(batch_size, n=n_cards, step=step, seed=1)
         all_states.extend(states)
         batch = public_state_from_game(states, max_cards=13, device=device)
         p1_targets = [
@@ -230,7 +269,21 @@ def run_stage1_pretrain(
             "masked_history_action_loss": float(masked_action_loss.detach().cpu()),
             "style_contrastive_loss": float(style_loss.detach().cpu()),
             "known_transition_samples": float(len(p1_targets)),
+            "corpus_states": float(len(corpus_states)),
+            "trained_on_corpus": float(bool(corpus_states)),
         }
+        if logger is not None and _should_log_step(step, int(steps)):
+            logger.step_metrics(
+                "stage1_pretrain",
+                step,
+                int(steps),
+                {
+                    "loss": float(loss.detach().cpu()),
+                    "loss_q": float(loss_q.detach().cpu()),
+                    "swap": float(swap_loss.detach().cpu()),
+                    "opp": float(opp_loss.detach().cpu()),
+                },
+            )
 
     checkpoint_path = None
     if metrics:
@@ -253,13 +306,24 @@ def run_stage1_pretrain(
                 metrics=metrics or {"loss_last": 0.0},
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
+                parent_checkpoint_sha256=lineage.get("parent_checkpoint_sha256"),
                 model_config_hash=model_config_hash(getattr(model, "module", model)),
+                datasets=(
+                    [dataset_provenance(
+                        corpus_path,
+                        num_samples=len(corpus_states),
+                        role="game_corpus",
+                    )]
+                    if corpus_states else []
+                ),
                 optimizer_reset=lineage["optimizer_reset"],
             ),
         )
         registry = CheckpointRegistry(out_dir / "registry")
         registry.register("latest", ckpt, global_step=int(steps), metrics=metrics)
         checkpoint_path = manifest["path"]
+        if logger is not None:
+            logger.checkpoint_saved("stage1_pretrain", checkpoint_path, global_step=int(steps))
     barrier_if_distributed()
     return StageMetrics("P1_PRETRAIN", int(steps), metrics or {"loss_last": 0.0}, checkpoint_path)
 
@@ -288,6 +352,30 @@ def _load_teacher_dataset(path: Path) -> list[dict[str, Any]]:
     return list(store.iter_dicts())
 
 
+def _load_corpus_states(path: Path) -> list[GameState]:
+    """Reconstruct trainable (non-terminal) states from a game corpus JSONL.
+
+    This is the seam that makes ``build_corpus`` a live producer instead of a
+    dead artifact: P1 pretrains over the states actually recorded in
+    ``game_corpus.jsonl`` when it exists.  Terminal states and states with no
+    legal self/opponent actions are skipped — P1's targets need a playable
+    ``(self_action, opponent_action)`` pair.
+    """
+    if not path.exists():
+        return []
+    store = JsonlStore(path)
+    states: list[GameState] = []
+    for rec in store.iter_dicts():
+        state_rec = rec.get("state")
+        if not isinstance(state_rec, dict):
+            continue
+        st = _game_state_from_record(state_rec)
+        if st.done or not st.self_actions or not st.opponent_actions:
+            continue
+        states.append(st)
+    return states
+
+
 def run_stage3_sft(
     *,
     steps: int,
@@ -299,6 +387,7 @@ def run_stage3_sft(
     teacher_dataset_path: str | Path | None = None,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
+    logger: "TrainingLogger | None" = None,
 ) -> StageMetrics:
     """P3 Robust Strategic SFT that CONSUMES the multi-source teacher dataset.
 
@@ -374,6 +463,14 @@ def run_stage3_sft(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             last_loss = float(loss.detach().cpu())
+            if logger is not None and _should_log_step(step, int(steps)):
+                logger.step_metrics(
+                    "stage3_sft",
+                    step,
+                    int(steps),
+                    {"loss": last_loss, "q_loss": float(q_loss.detach().cpu()),
+                     "pi_loss": float(pi_loss.detach().cpu())},
+                )
     else:
         for step in range(int(steps)):
             states = sample_reachable_states(batch_size, n=n_cards, step=step, seed=1)
@@ -393,6 +490,14 @@ def run_stage3_sft(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             last_loss = float(loss.detach().cpu())
+            if logger is not None and _should_log_step(step, int(steps)):
+                logger.step_metrics(
+                    "stage3_sft",
+                    step,
+                    int(steps),
+                    {"loss": last_loss, "q_loss": float(q_loss.detach().cpu()),
+                     "pi_loss": float(pi_loss.detach().cpu())},
+                )
 
     checkpoint_path = None
     metrics = {
@@ -426,8 +531,17 @@ def run_stage3_sft(
                 metrics=metrics,
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
+                parent_checkpoint_sha256=lineage.get("parent_checkpoint_sha256"),
                 model_config_hash=model_config_hash(getattr(model, "module", model)),
                 teacher_dataset_ids=[str(teacher_dataset_path)] if dataset else [],
+                datasets=(
+                    [dataset_provenance(
+                        teacher_dataset_path,
+                        num_samples=len(dataset),
+                        role="teacher_dataset",
+                    )]
+                    if dataset else []
+                ),
                 optimizer_reset=lineage["optimizer_reset"],
             ),
         )
@@ -435,6 +549,8 @@ def run_stage3_sft(
         registry.register("latest", ckpt, global_step=int(steps), metrics=metrics)
         registry.register("teacher_ema", ckpt, global_step=int(steps), metrics=metrics)
         checkpoint_path = manifest["path"]
+        if logger is not None:
+            logger.checkpoint_saved("stage3_sft", checkpoint_path, global_step=int(steps))
     barrier_if_distributed()
     return StageMetrics("P3_STRATEGIC_SFT", int(steps), metrics, checkpoint_path)
 
@@ -609,6 +725,7 @@ def run_stage4_robust_rl(
     lr: float = 1e-4,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
+    logger: "TrainingLogger | None" = None,
 ) -> StageMetrics:
     """Self-play robust RL runner using trajectory replay + Nash/NeuRD anchors.
 
@@ -734,6 +851,19 @@ def run_stage4_robust_rl(
         last_pg = float(pg_loss.detach().cpu())
         last_entropy = float(entropy.detach().cpu())
         transitions_total += len(states)
+        if logger is not None and _should_log_step(step, int(steps)):
+            logger.step_metrics(
+                "stage4_robust_rl",
+                step,
+                int(steps),
+                {
+                    "q": last_q,
+                    "actor": last_actor,
+                    "pg": last_pg,
+                    "entropy": last_entropy,
+                    "curriculum_n": cstep.n_cards,
+                },
+            )
 
     checkpoint_path = None
     stage_metrics = {
@@ -765,6 +895,7 @@ def run_stage4_robust_rl(
                 metrics=stage_metrics,
                 parent_checkpoint_id=lineage["parent_checkpoint_id"],
                 init_checkpoint_id=lineage["init_checkpoint_id"],
+                parent_checkpoint_sha256=lineage.get("parent_checkpoint_sha256"),
                 model_config_hash=model_config_hash(getattr(model, "module", model)),
                 optimizer_reset=lineage["optimizer_reset"],
             ),
@@ -783,6 +914,8 @@ def run_stage4_robust_rl(
         # only when an evaluation actually selects a distinct checkpoint for it.
         registry.register("latest", ckpt, global_step=int(steps), metrics=stage_metrics)
         checkpoint_path = manifest["path"]
+        if logger is not None:
+            logger.checkpoint_saved("stage4_robust_rl", checkpoint_path, global_step=int(steps))
     barrier_if_distributed()
     stage_metrics["promotion_candidate"] = 1.0 if promotion.decision == "PROMOTE_CANDIDATE" else 0.0
     stage_metrics["replay_persisted_samples"] = float(replay_buffer.persisted_count()) if runtime.is_rank0 else 0.0
@@ -972,6 +1105,7 @@ def run_stage5_adaptive(
     lr: float = 3e-4,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
+    logger: "TrainingLogger | None" = None,
 ) -> StageMetrics:
     """P5 — TRAIN the opponent/adaptive branch on scripted-regime sessions.
 
@@ -1088,6 +1222,13 @@ def run_stage5_adaptive(
             ece = _expected_calibration_error(probs, target_t)
         last = {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm,
                 "robust_delta": 0.0}
+        if logger is not None and _should_log_step(_step, train_steps):
+            logger.step_metrics(
+                "stage5_adaptive",
+                _step,
+                train_steps,
+                {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm},
+            )
     # Firewall assertion #2: robust params are byte-for-byte unchanged.
     robust_delta = float(sum(
         (a - b).abs().sum() for a, b in zip(model.robust_parameters(), robust_snapshot)
@@ -1118,11 +1259,14 @@ def run_stage5_adaptive(
             },
             parent_checkpoint_id=lineage["parent_checkpoint_id"],
             init_checkpoint_id=lineage["init_checkpoint_id"],
+            parent_checkpoint_sha256=lineage.get("parent_checkpoint_sha256"),
             model_config_hash=model_config_hash(model),
             optimizer_reset=lineage["optimizer_reset"],
         ),
     )
     ckpt_path = manifest["path"]
+    if logger is not None:
+        logger.checkpoint_saved("stage5_adaptive", ckpt_path, global_step=train_steps)
 
     report = {
         # A trained opponent model now exists. It is usable iff it beat the honest
@@ -1757,7 +1901,10 @@ def run_smoke_pipeline(
     emit("stage0_verify", {"ok": stage0.ok, "checks": stage0.checks})
     corpus = generate_random_game_corpus(out_path=out / "data" / "game_corpus.jsonl", num_games=num_corpus_games, seed=seed)
     emit("build_corpus", {"ok": True, "metrics": corpus})
-    stage1 = run_stage1_pretrain(steps=steps, batch_size=batch_size, out_dir=out / "checkpoints", device=device, n_cards=n_cards)
+    stage1 = run_stage1_pretrain(
+        steps=steps, batch_size=batch_size, out_dir=out / "checkpoints", device=device, n_cards=n_cards,
+        corpus_path=out / "data" / "game_corpus.jsonl",
+    )
     emit("stage1_pretrain", {"ok": True, "metrics": stage1.metrics, "checkpoint": stage1.checkpoint})
     stage2 = run_stage2_semi_supervised(steps=steps, out_dir=out / "data", n_cards=n_cards)
     emit("stage2_semi_supervised", {"ok": True, "metrics": stage2.metrics})

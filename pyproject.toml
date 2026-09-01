@@ -102,6 +102,7 @@ fail_on_build_error     = false
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (exclude from default runs with -m 'not slow')",
+    "integration: end-to-end tests that run a full training sequence (slower; exclude with -m 'not integration')",
 ]
 
 [tool.ruff]

@@ -20,6 +20,7 @@ from goofspiel.training.model_eval import (
     full_game_exploitability,
     one_step_matrix_nash_gap,
     play_policy_scripted_game,
+    play_policy_vs_bot,
     uniform_policy_fn,
     _reachable_opening_states,
 )
@@ -184,3 +185,75 @@ def test_evaluator_reads_the_checkpoint_weights(tmp_path: Path):
     db = pol_b(state)
     # Distributions must differ -> the loader reflects each file's own weights.
     assert any(abs(da[c] - db[c]) > 1e-6 for c in da), "loaded policies identical -> loader ignored weights"
+
+
+# ======================================================================
+# evaluate_checkpoint — top-level report was previously zero-covered
+# ======================================================================
+def test_evaluate_checkpoint_reports_real_matchups(tmp_path: Path):
+    """The top-level report loads a REAL trained checkpoint and computes every
+    axis: per-opponent matchups (rates in-range), full-game exploitability
+    (a real number at small N), and the any-N one-step proxy.
+
+    Re-executes the fact: it runs the actual games/enumeration rather than
+    reading a stored evaluation blob.
+    """
+    torch = pytest.importorskip("torch")  # noqa: F841
+    from goofspiel.training.model_eval import evaluate_checkpoint
+    from goofspiel.training.stages import run_stage1_pretrain
+
+    p1 = run_stage1_pretrain(steps=2, batch_size=8, out_dir=tmp_path / "ck", n_cards=3)
+    report = evaluate_checkpoint(
+        p1.checkpoint,
+        n_cards=(3,),
+        num_games=16,
+        opponents=("random", "heuristic"),
+    )
+
+    # It reflects THIS checkpoint's identity, read from the file.
+    assert report.checkpoint_id == "stage1_pretrain"
+    assert report.training_stage == "P1_PRETRAIN"
+
+    # Every requested matchup is present and every rate is a real probability.
+    for opp in ("random", "heuristic"):
+        key = f"N3_vs_{opp}"
+        assert key in report.matchups, report.matchups.keys()
+        m = report.matchups[key]
+        assert m["games"] == 16.0
+        assert 0.0 <= m["win_rate"] <= 1.0
+        assert 0.0 <= m["draw_rate"] <= 1.0
+        assert m["win_rate"] + m["draw_rate"] <= 1.0 + 1e-9
+
+    # N=3 is well within the enumeration budget, so exploitability is a real
+    # number (not the honest-None it returns for large N), and the proxy is a
+    # valid non-negative gap.
+    assert report.full_game_exploitability["N3"] is not None
+    assert report.full_game_exploitability["N3"] >= 0.0
+    assert report.one_step_matrix_nash_gap["N3"] >= 0.0
+
+
+# ======================================================================
+# play_policy_vs_bot — reproducibility guard (locks the HeuristicBot fix)
+# ======================================================================
+def test_play_policy_vs_bot_is_reproducible():
+    """Same seed + same policy -> bit-identical result, for BOTH random AND
+    heuristic opponents.
+
+    This is the guard for the real bug fixed in ``bots.py``: ``HeuristicBot``
+    used the GLOBAL ``np.random`` to sample neighbour cards, so a fixed
+    ``create_bot(seed=...)`` was NOT actually deterministic and this whole
+    thermometer carried hidden noise against the heuristic.  If that regresses,
+    the heuristic assertion below breaks while the random one still passes —
+    pinning the defect precisely.
+    """
+    policy = uniform_policy_fn()
+    for opp in ("random", "heuristic"):
+        r1 = play_policy_vs_bot(policy, opp, n_cards=4, num_games=24, seed=1234)
+        r2 = play_policy_vs_bot(policy, opp, n_cards=4, num_games=24, seed=1234)
+        assert r1 == r2, f"{opp}: same seed produced different results -> hidden RNG"
+
+    # A different seed should generally produce a different sample (sanity: the
+    # seed actually drives the play, so "reproducible" isn't just a constant).
+    a = play_policy_vs_bot(uniform_policy_fn(), "heuristic", n_cards=4, num_games=24, seed=1)
+    b = play_policy_vs_bot(uniform_policy_fn(), "heuristic", n_cards=4, num_games=24, seed=2)
+    assert a != b, "different seeds gave identical results -> seed is ignored"

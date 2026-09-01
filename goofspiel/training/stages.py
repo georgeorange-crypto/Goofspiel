@@ -202,7 +202,17 @@ def run_stage1_pretrain(
     runtime, device = setup_torch_distributed(device)
     model = GoofspielModel(max_cards=13).to(device)
     if runtime.is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[runtime.local_rank] if device.startswith("cuda") else None)
+        # GoofspielModel is multi-branch (robust + adaptive/opponent heads); a
+        # single stage's loss exercises only some branches, so the others produce
+        # no grad this iteration.  Default DDP forbids that and aborts on step 1
+        # ("Expected to have finished reduction..."); find_unused_parameters lets
+        # the reducer skip the idle params instead.  Required for correctness
+        # here, not a perf knob.
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
+            find_unused_parameters=True,
+        )
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     lineage = _apply_init_or_resume(
         model,
@@ -411,7 +421,13 @@ def run_stage3_sft(
     runtime, device = setup_torch_distributed(device)
     model = GoofspielModel(max_cards=13).to(device)
     if runtime.is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[runtime.local_rank] if device.startswith("cuda") else None)
+        # See stage1: multi-branch model → some params are idle per stage, so DDP
+        # must tolerate unused parameters or it aborts after the first step.
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
+            find_unused_parameters=True,
+        )
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     lineage = _apply_init_or_resume(
         model,
@@ -757,7 +773,13 @@ def run_stage4_robust_rl(
         target_model.load_state_dict(getattr(model, "module", model).state_dict())
     target_model.eval()
     if runtime.is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[runtime.local_rank] if device.startswith("cuda") else None)
+        # See stage1: the robust-RL loss leaves the adaptive branch idle, so DDP
+        # must tolerate unused parameters or it aborts after the first step.
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
+            find_unused_parameters=True,
+        )
     replay_buffer = TrajectoryReplayBuffer(Path(out_dir) / "replay" / "selfplay_robust.jsonl")
     event_sink = JsonlEventSink(Path(out_dir) / "events" / "stage4_robust_rl.jsonl")
     warmup_n = n_cards if int(steps) <= 1 else min(3, n_cards)

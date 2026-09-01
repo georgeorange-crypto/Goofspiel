@@ -424,12 +424,20 @@ def run_stage3_sft(
     runtime, device = setup_torch_distributed(device)
     model = GoofspielModel(max_cards=13).to(device)
     if runtime.is_distributed:
-        # See stage1: multi-branch model → some params are idle per stage, so DDP
-        # must tolerate unused parameters or it aborts after the first step.
+        # GoofspielModel.forward ALWAYS computes and returns every head (robust +
+        # opponent + adaptive); stage3's loss consumes only the robust outputs.
+        # find_unused_parameters keys off what forward RETURNS, not what the loss
+        # uses — so it marks the opponent/adaptive params "used" (they are
+        # reachable from the returned logits), then aborts when they receive no
+        # grad ("...not all forward outputs participate in computing loss").
+        # static_graph=True instead learns the true gradient-receiving set from
+        # the first backward and reuses it; the per-stage loss is fixed, so that
+        # set is stable across steps (static_graph's precondition).  Same reason
+        # as stage1; see the note there.
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
-            find_unused_parameters=True,
+            static_graph=True,
         )
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     lineage = _apply_init_or_resume(
@@ -776,12 +784,17 @@ def run_stage4_robust_rl(
         target_model.load_state_dict(getattr(model, "module", model).state_dict())
     target_model.eval()
     if runtime.is_distributed:
-        # See stage1: the robust-RL loss leaves the adaptive branch idle, so DDP
-        # must tolerate unused parameters or it aborts after the first step.
+        # See stage1/stage3: forward always returns every head, but the robust-RL
+        # loss uses only the robust outputs, leaving the opponent/adaptive branch
+        # idle.  find_unused_parameters marks those params used (reachable from the
+        # returned logits) then aborts when they get no grad; static_graph=True
+        # learns the real gradient set from backward 0 and reuses it.  The loss is
+        # fixed step-to-step (only the sampled data / curriculum n changes, not the
+        # graph topology of the trainable model), so the used-param set is static.
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
-            find_unused_parameters=True,
+            static_graph=True,
         )
     replay_buffer = TrajectoryReplayBuffer(Path(out_dir) / "replay" / "selfplay_robust.jsonl")
     event_sink = JsonlEventSink(Path(out_dir) / "events" / "stage4_robust_rl.jsonl")

@@ -254,6 +254,7 @@ class TrainingCoordinator:
             )
             return {"stage": stage, "ok": True, "metrics": asdict(metrics)}
         if stage == "stage4_robust_rl":
+            resume_interval = int(self.config.extra.get("stage4_resume_checkpoint_interval", 250))
             metrics = run_stage4_robust_rl(
                 steps=self.config.steps,
                 batch_size=self.config.batch_size,
@@ -263,6 +264,7 @@ class TrainingCoordinator:
                 seed=self.config.seed,
                 init_from_checkpoint=init_from_checkpoint,
                 resume_checkpoint=resume,
+                resume_checkpoint_interval=resume_interval,
                 logger=self.logger,
             )
             return {"stage": stage, "ok": True, "metrics": asdict(metrics)}

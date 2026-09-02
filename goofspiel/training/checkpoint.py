@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import random
 import time
@@ -73,20 +74,141 @@ def dataset_provenance(
     }
 
 
-def collect_rng_state() -> dict[str, Any]:
+def serialize_python_random_state(state: object) -> dict[str, Any]:
+    """Serialize ``random.getstate()`` / ``Random.getstate()`` losslessly.
+
+    The native state is a tuple containing another tuple.  Storing it as a
+    structured list keeps the checkpoint schema explicit and lets us restore a
+    per-rank ``random.Random`` stream without relying on ``repr`` parsing.
+    """
+    version, internal_state, gauss_next = state  # type: ignore[misc]
+    return {
+        "version": int(version),
+        "internal_state": [int(x) for x in internal_state],
+        "gauss_next": gauss_next,
+    }
+
+
+def deserialize_python_random_state(payload: dict[str, Any]) -> object:
+    return (
+        int(payload["version"]),
+        tuple(int(x) for x in payload["internal_state"]),
+        payload.get("gauss_next"),
+    )
+
+
+def restore_python_random_state(payload: dict[str, Any], rng: random.Random | None = None) -> None:
+    state = deserialize_python_random_state(payload)
+    if rng is None:
+        random.setstate(state)
+    else:
+        rng.setstate(state)
+
+
+def serialize_numpy_random_state(state: object) -> dict[str, Any]:
+    name, keys, pos, has_gauss, cached_gaussian = state  # type: ignore[misc]
+    return {
+        "bit_generator": str(name),
+        "keys": [int(x) for x in keys.tolist()],
+        "pos": int(pos),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached_gaussian),
+    }
+
+
+def restore_numpy_random_state(payload: dict[str, Any]) -> None:
+    np.random.set_state(
+        (
+            str(payload["bit_generator"]),
+            np.asarray(payload["keys"], dtype=np.uint32),
+            int(payload["pos"]),
+            int(payload["has_gauss"]),
+            float(payload["cached_gaussian"]),
+        )
+    )
+
+
+def _torch_rng_tensor(values: list[int]) -> Any:
+    import torch
+
+    return torch.tensor([int(x) for x in values], dtype=torch.uint8)
+
+
+def _cuda_device_index(torch_module: Any, torch_device: str | int | None) -> int | None:
+    if not torch_module.cuda.is_available():
+        return None
+    if torch_device is None:
+        return int(torch_module.cuda.current_device())
+    if isinstance(torch_device, int):
+        return int(torch_device)
+    if str(torch_device).startswith("cuda"):
+        device = torch_module.device(str(torch_device))
+        return int(device.index if device.index is not None else torch_module.cuda.current_device())
+    return None
+
+
+def collect_rng_state(*, torch_device: str | int | None = None) -> dict[str, Any]:
     state = {
-        "python_random": repr(random.getstate()),
-        "numpy_random": repr(np.random.get_state()),
+        "python_random": serialize_python_random_state(random.getstate()),
+        "numpy_random": serialize_numpy_random_state(np.random.get_state()),
     }
     try:
         import torch
 
         state["torch_cpu_rng"] = torch.get_rng_state().cpu().numpy().tolist()
-        if torch.cuda.is_available():
-            state["torch_cuda_rng"] = [s.cpu().numpy().tolist() for s in torch.cuda.get_rng_state_all()]
+        cuda_device = _cuda_device_index(torch, torch_device)
+        if cuda_device is not None:
+            state["torch_cuda_device"] = int(cuda_device)
+            state["torch_cuda_current_device_rng"] = torch.cuda.get_rng_state(cuda_device).cpu().numpy().tolist()
     except Exception as exc:  # pragma: no cover - environment dependent
         state["torch_rng_unavailable"] = repr(exc)
     return state
+
+
+def restore_rng_state(state: dict[str, Any], *, torch_device: str | int | None = None) -> None:
+    """Restore the process-global Python, NumPy, and Torch RNG streams."""
+    if "python_random" in state:
+        restore_python_random_state(state["python_random"])
+    if "numpy_random" in state:
+        restore_numpy_random_state(state["numpy_random"])
+    try:
+        import torch
+
+        if "torch_cpu_rng" in state:
+            torch.set_rng_state(_torch_rng_tensor(state["torch_cpu_rng"]))
+        cuda_payload = state.get("torch_cuda_current_device_rng")
+        if cuda_payload is not None and torch.cuda.is_available():
+            cuda_device = _cuda_device_index(torch, torch_device)
+            if cuda_device is None:
+                cuda_device = int(state.get("torch_cuda_device", torch.cuda.current_device()))
+            torch.cuda.set_rng_state(_torch_rng_tensor(cuda_payload), device=cuda_device)
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(f"failed to restore torch RNG state: {exc}") from exc
+
+
+def state_dict_sha256(state_dict: dict[str, Any]) -> str:
+    """Content hash for a torch ``state_dict`` independent of object identity."""
+    h = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name]
+        h.update(str(name).encode("utf-8"))
+        h.update(str(tuple(tensor.shape)).encode("utf-8"))
+        h.update(str(tensor.dtype).encode("utf-8"))
+        h.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 def save_checkpoint(
@@ -96,6 +218,8 @@ def save_checkpoint(
     optimizers: dict[str, Any] | None,
     metadata: CheckpointMetadata,
     extra: dict[str, Any] | None = None,
+    atomic: bool = False,
+    rng_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -107,14 +231,30 @@ def save_checkpoint(
         "optimizer_states": {
             name: opt.state_dict() for name, opt in (optimizers or {}).items()
         },
-        "rng_state": collect_rng_state(),
+        "rng_state": rng_state if rng_state is not None else collect_rng_state(),
         "extra": extra or {},
     }
-    torch.save(payload, path)
+    if atomic:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            with tmp.open("wb") as handle:
+                torch.save(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+    else:
+        torch.save(payload, path)
     checksum = sha256_file(path)
     manifest = {"path": str(path), "sha256": checksum, "metadata": asdict(metadata)}
     manifest_path = path.with_suffix(path.suffix + ".sha256.json")
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
+    if atomic:
+        _write_text_atomic(manifest_path, manifest_text)
+    else:
+        manifest_path.write_text(manifest_text, encoding="utf-8")
     return manifest
 
 

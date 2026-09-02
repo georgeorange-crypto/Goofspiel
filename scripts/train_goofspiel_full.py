@@ -73,6 +73,8 @@ def parse_args() -> argparse.Namespace:
                    help="Seed θ (weights only) from this checkpoint; overrides auto-discovery.")
     p.add_argument("--resume-checkpoint", default=None,
                    help="Crash resume: restore full training state (model+optimizer+step).")
+    p.add_argument("--stage4-resume-checkpoint-interval", type=int, default=250,
+                   help="Stage4 periodic crash-resume checkpoint interval in stage steps.")
     # Phase 0.1: honest evaluation of a trained checkpoint. When supplied, the
     # script evaluates the checkpoint and exits without running any stage.
     p.add_argument("--eval-checkpoint", default=None,
@@ -97,6 +99,7 @@ def config_from_args(args: argparse.Namespace) -> TrainingRunConfig:
         dry_run=args.dry_run,
         init_from_checkpoint=args.init_from_checkpoint,
         resume_checkpoint=args.resume_checkpoint,
+        extra={"stage4_resume_checkpoint_interval": args.stage4_resume_checkpoint_interval},
     )
 
 

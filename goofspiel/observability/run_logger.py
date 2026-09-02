@@ -271,6 +271,33 @@ class TrainingLogger:
             },
         )
 
+    def resume_stage(
+        self,
+        stage: str,
+        *,
+        completed_step: int,
+        next_step: int,
+        total_steps: int,
+        checkpoint: str | Path,
+    ) -> None:
+        display_stage = "Stage4" if stage == "stage4_robust_rl" else stage
+        msg = (
+            f"resume {display_stage}: checkpoint completed_step={completed_step} "
+            f"-> continuing at step={next_step} / {total_steps}"
+        )
+        self._log(logging.INFO, stage, msg)
+        self._emit(
+            "STAGE_RESUME",
+            step=next_step,
+            payload={
+                "stage": stage,
+                "completed_step": int(completed_step),
+                "next_step": int(next_step),
+                "total_steps": int(total_steps),
+                "checkpoint": str(checkpoint),
+            },
+        )
+
     # -------------------------------------------------------------- lineage ----
     def lineage_verdict(
         self,

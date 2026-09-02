@@ -18,9 +18,16 @@ if TYPE_CHECKING:
     from goofspiel.observability import TrainingLogger
 from goofspiel.training.checkpoint import (
     CheckpointMetadata,
+    collect_rng_state,
     dataset_provenance,
+    load_checkpoint,
     model_config_hash,
+    restore_python_random_state,
+    restore_rng_state,
     save_checkpoint,
+    serialize_python_random_state,
+    sha256_file,
+    state_dict_sha256,
 )
 from goofspiel.training.checkpoint import init_from_checkpoint as _load_init_from_checkpoint
 from goofspiel.training.checkpoint import resume_checkpoint as _load_resume_checkpoint
@@ -939,6 +946,238 @@ def _flatten_trajectory_batch(trajectories: list[RobustTrajectorySample]) -> tup
     return states, self_actions, opp_actions, returns
 
 
+def _replay_snapshot_hash(snapshot: dict[str, Any]) -> str:
+    encoded = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _rank_rng_payload(
+    *,
+    rank: int,
+    device: str,
+    rollout_rng: random.Random,
+    replay_rng: random.Random,
+) -> dict[str, Any]:
+    payload = collect_rng_state(torch_device=device)
+    payload["rank"] = int(rank)
+    payload["rollout_rng"] = serialize_python_random_state(rollout_rng.getstate())
+    payload["replay_rng"] = serialize_python_random_state(replay_rng.getstate())
+    return payload
+
+
+def _gather_stage4_rng_state_by_rank(
+    *,
+    runtime: Any,
+    device: str,
+    rollout_rng: random.Random,
+    replay_rng: random.Random,
+) -> dict[str, Any]:
+    local = _rank_rng_payload(
+        rank=runtime.rank,
+        device=device,
+        rollout_rng=rollout_rng,
+        replay_rng=replay_rng,
+    )
+    gathered = all_gather_objects(local)
+    return {str(int(row["rank"])): row for row in gathered}
+
+
+def _restore_stage4_rank_rng(
+    payload: dict[str, Any],
+    *,
+    device: str,
+    rollout_rng: random.Random,
+    replay_rng: random.Random,
+) -> None:
+    restore_rng_state(payload, torch_device=device)
+    restore_python_random_state(payload["rollout_rng"], rollout_rng)
+    restore_python_random_state(payload["replay_rng"], replay_rng)
+
+
+def _write_stage4_resume_checkpoint(
+    *,
+    path: Path,
+    model: Any,
+    optimizer: Any,
+    target_model: Any,
+    stage_step_completed: int,
+    total_steps: int,
+    stage_metrics: dict[str, float],
+    config: dict[str, Any],
+    lineage: dict[str, Any],
+    replay_buffer: TrajectoryReplayBuffer,
+    curriculum: ProgressiveCurriculum,
+    rng_state_by_rank: dict[str, Any],
+    save_step_copy: bool = True,
+) -> dict[str, Any]:
+    replay_snapshot = replay_buffer.snapshot()
+    target_state = target_model.state_dict()
+    metadata = CheckpointMetadata(
+        checkpoint_id="stage4_robust_rl_resume",
+        training_stage="P4_ROBUST_RL_RESUME",
+        global_step=int(stage_step_completed) + 1,
+        policy_version=2,
+        config=config,
+        metrics=stage_metrics,
+        parent_checkpoint_id=lineage["parent_checkpoint_id"],
+        init_checkpoint_id=lineage["init_checkpoint_id"],
+        parent_checkpoint_sha256=lineage.get("parent_checkpoint_sha256"),
+        model_config_hash=model_config_hash(getattr(model, "module", model)),
+        optimizer_reset=lineage["optimizer_reset"],
+    )
+    extra = {
+        "checkpoint_kind": "stage4_periodic_resume",
+        "stage_step_completed": int(stage_step_completed),
+        "next_stage_step": int(stage_step_completed) + 1,
+        "total_steps": int(total_steps),
+        "world_size": int(config["world_size"]),
+        "seed": int(config["seed"]),
+        "target_model_state": target_state,
+        "target_model_sha256": state_dict_sha256(target_state),
+        "replay_snapshot": replay_snapshot,
+        "replay_snapshot_sha256": _replay_snapshot_hash(replay_snapshot),
+        "curriculum": {
+            "target_n": curriculum.target_n,
+            "warmup_n": curriculum.warmup_n,
+            "ramp_every": curriculum.ramp_every,
+            "state_semantics": "stateless_function_of_stage_step",
+        },
+        "rng_state_by_rank": rng_state_by_rank,
+        "stage4_config": dict(config),
+        "lineage": dict(lineage),
+    }
+    manifest = save_checkpoint(
+        path,
+        model=getattr(model, "module", model),
+        optimizers={"robust_rl": optimizer},
+        metadata=metadata,
+        extra=extra,
+        atomic=True,
+        rng_state={"rng_state_by_rank": rng_state_by_rank},
+    )
+    if save_step_copy:
+        step_path = path.with_name(f"stage4_resume_step_{int(stage_step_completed):06d}.pt")
+        save_checkpoint(
+            step_path,
+            model=getattr(model, "module", model),
+            optimizers={"robust_rl": optimizer},
+            metadata=metadata,
+            extra=extra,
+            atomic=True,
+            rng_state={"rng_state_by_rank": rng_state_by_rank},
+        )
+    return manifest
+
+
+def _restore_stage4_resume_state(
+    *,
+    checkpoint_path: str | Path,
+    model: Any,
+    optimizer: Any,
+    target_model: Any,
+    replay_buffer: TrajectoryReplayBuffer,
+    rollout_rng: random.Random,
+    replay_rng: random.Random,
+    runtime: Any,
+    device: str,
+    steps: int,
+    batch_size: int,
+    n_cards: int,
+    lr: float,
+    seed: int,
+) -> dict[str, Any]:
+    payload = load_checkpoint(checkpoint_path)
+    meta = payload.get("metadata", {})
+    extra = payload.get("extra", {})
+    if extra.get("checkpoint_kind") != "stage4_periodic_resume":
+        raise RuntimeError(
+            f"Stage4 crash resume requires a periodic resume checkpoint; got "
+            f"{extra.get('checkpoint_kind')!r} from {checkpoint_path}"
+        )
+    ckpt_world_size = int(extra.get("world_size", meta.get("config", {}).get("world_size", 1)))
+    if ckpt_world_size != int(runtime.world_size):
+        raise RuntimeError(
+            f"Stage4 exact crash resume requires same world_size: "
+            f"checkpoint={ckpt_world_size}, current={runtime.world_size}"
+        )
+    ckpt_config = extra.get("stage4_config", meta.get("config", {}))
+    expected = {
+        "batch_size": int(batch_size),
+        "n_cards": int(n_cards),
+        "seed": int(seed),
+    }
+    actual = {
+        "batch_size": int(ckpt_config.get("batch_size", -1)),
+        "n_cards": int(ckpt_config.get("n_cards", -1)),
+        "seed": int(ckpt_config.get("seed", -1)),
+    }
+    if actual != expected:
+        raise RuntimeError(f"Stage4 resume config mismatch: checkpoint={actual}, current={expected}")
+    if abs(float(ckpt_config.get("lr", lr)) - float(lr)) > 1e-18:
+        raise RuntimeError(f"Stage4 resume lr mismatch: checkpoint={ckpt_config.get('lr')} current={lr}")
+    completed_step = int(extra["stage_step_completed"])
+    if int(steps) <= completed_step:
+        raise RuntimeError(
+            f"Stage4 resume target steps must exceed completed step: "
+            f"completed={completed_step}, requested_total={steps}"
+        )
+
+    target_state = extra.get("target_model_state")
+    if not target_state:
+        raise RuntimeError("Stage4 resume checkpoint is missing target_model_state")
+    target_model.load_state_dict(target_state, strict=True)
+    target_hash = state_dict_sha256(target_model.state_dict())
+    if target_hash != extra.get("target_model_sha256"):
+        raise RuntimeError("Stage4 target_model_state hash mismatch during resume")
+
+    replay_snapshot = extra.get("replay_snapshot")
+    if not replay_snapshot:
+        raise RuntimeError("Stage4 resume checkpoint is missing replay_snapshot")
+    if _replay_snapshot_hash(replay_snapshot) != extra.get("replay_snapshot_sha256"):
+        raise RuntimeError("Stage4 replay snapshot hash mismatch during resume")
+    replay_buffer.restore_snapshot(replay_snapshot)
+    if runtime.is_rank0:
+        replay_buffer.rewrite_store_from_memory()
+
+    model.load_state_dict(payload["model_state"], strict=True)
+    stored_opts = payload.get("optimizer_states", {})
+    if "robust_rl" not in stored_opts:
+        raise RuntimeError("Stage4 resume checkpoint is missing robust_rl optimizer state")
+    optimizer.load_state_dict(stored_opts["robust_rl"])
+
+    rng_state_by_rank = extra.get("rng_state_by_rank", {})
+    rank_key = str(int(runtime.rank))
+    if rank_key not in rng_state_by_rank:
+        raise RuntimeError(f"Stage4 resume checkpoint has no RNG payload for rank {runtime.rank}")
+    _restore_stage4_rank_rng(
+        rng_state_by_rank[rank_key],
+        device=device,
+        rollout_rng=rollout_rng,
+        replay_rng=replay_rng,
+    )
+
+    next_step = int(extra["next_stage_step"])
+    if next_step != completed_step + 1:
+        raise RuntimeError(
+            f"Stage4 resume step metadata inconsistent: completed={completed_step}, next={next_step}"
+        )
+    saved_lineage = extra.get("lineage", {})
+    return {
+        "parent_checkpoint_id": saved_lineage.get("parent_checkpoint_id"),
+        "init_checkpoint_id": saved_lineage.get("init_checkpoint_id"),
+        "init_checkpoint_sha256": saved_lineage.get("init_checkpoint_sha256"),
+        "resume_sha256": sha256_file(checkpoint_path),
+        "resume_checkpoint_id": meta.get("checkpoint_id"),
+        "parent_checkpoint_sha256": saved_lineage.get("parent_checkpoint_sha256"),
+        "optimizer_reset": False,
+        "resumed_stage_step_completed": completed_step,
+        "next_stage_step": next_step,
+        "restored_target_model": True,
+        "restored_replay_samples": replay_buffer.count(),
+        "restored_replay_snapshot_sha256": extra.get("replay_snapshot_sha256"),
+    }
+
+
 def run_stage4_robust_rl(
     *,
     steps: int,
@@ -950,6 +1189,7 @@ def run_stage4_robust_rl(
     seed: int = 1,
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
+    resume_checkpoint_interval: int = 250,
     logger: "TrainingLogger | None" = None,
 ) -> StageMetrics:
     """Self-play robust RL runner using trajectory replay + Nash/NeuRD anchors.
@@ -968,28 +1208,13 @@ def run_stage4_robust_rl(
     from goofspiel.learning.game_theory.regret_matching_plus import solve_batch
     from goofspiel.models import GoofspielModel, public_state_from_game
 
+    total_steps = int(steps)
     seed_everything(int(seed))
     runtime, device = setup_torch_distributed(device)
     rank_seed = derive_rank_seed(int(seed), runtime.rank)
     model = GoofspielModel(max_cards=13).to(device)
     target_model = GoofspielModel(max_cards=13).to(device)
     opt_q = torch.optim.AdamW(model.parameters(), lr=lr)
-    lineage = _apply_init_or_resume(
-        model,
-        init_from_checkpoint_path=init_from_checkpoint,
-        resume_checkpoint_path=resume_checkpoint,
-        optimizers={"robust_rl": opt_q},
-        target_model=target_model,
-    )
-    if not resume_checkpoint:
-        target_model.load_state_dict(getattr(model, "module", model).state_dict())
-    target_model.eval()
-    if runtime.is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
-            static_graph=True,
-        )
     replay_path = Path(out_dir) / "replay" / "selfplay_robust.jsonl"
     event_path = Path(out_dir) / "events" / "stage4_robust_rl.jsonl"
     if runtime.is_rank0 and not resume_checkpoint:
@@ -997,14 +1222,108 @@ def run_stage4_robust_rl(
         event_path.unlink(missing_ok=True)
     replay_buffer = TrajectoryReplayBuffer(replay_path)
     event_sink = JsonlEventSink(event_path) if runtime.is_rank0 else None
-    warmup_n = n_cards if int(steps) <= 1 else min(3, n_cards)
+    warmup_n = n_cards if total_steps <= 1 else min(3, n_cards)
     curriculum = ProgressiveCurriculum(
         target_n=n_cards,
         warmup_n=warmup_n,
-        ramp_every=max(1, int(steps) // max(1, n_cards - warmup_n + 1)),
+        ramp_every=max(1, total_steps // max(1, n_cards - warmup_n + 1)),
     )
     rollout_rng = random.Random(rank_seed)
-    replay_rng = random.Random(derive_rank_seed(int(seed) + 97, 0))
+    replay_rng = random.Random(derive_rank_seed(int(seed) + 97, runtime.rank))
+    resume_config = {
+        "steps": total_steps,
+        "batch_size": int(batch_size),
+        "global_training_batch_size": int(batch_size),
+        "global_rollout_batch_size": int(batch_size),
+        "per_rank_rollout_rule": "contiguous shard of global_rollout_batch_size",
+        "n_cards": int(n_cards),
+        "lr": float(lr),
+        "seed": int(seed),
+        "world_size": int(runtime.world_size),
+        "rank_seed_rule": "seed + rank",
+        "replay_semantics": "rank0_global_replay_sample_then_broadcast_to_all_ranks",
+        "neurd_logit_threshold": NEURD_LOGIT_THRESHOLD,
+        "neurd_threshold_step_size": float(lr),
+        "curriculum": {
+            "target_n": curriculum.target_n,
+            "warmup_n": curriculum.warmup_n,
+            "ramp_every": curriculum.ramp_every,
+            "state_semantics": "stateless_function_of_stage_step",
+        },
+        "resume_checkpoint_interval": int(resume_checkpoint_interval),
+    }
+    if init_from_checkpoint and resume_checkpoint:
+        raise ValueError(
+            "init_from_checkpoint and resume_checkpoint are mutually exclusive: "
+            "'inherit theta across a stage boundary' and 'resume a crashed run' are "
+            "different operations and must not be conflated."
+        )
+    lineage: dict[str, Any] = {
+        "parent_checkpoint_id": None,
+        "init_checkpoint_id": None,
+        "parent_checkpoint_sha256": None,
+        "optimizer_reset": True,
+        "resumed_stage_step_completed": -1,
+        "next_stage_step": 0,
+    }
+    start_step = 0
+    if init_from_checkpoint:
+        prov = _load_init_from_checkpoint(getattr(model, "module", model), init_from_checkpoint)
+        lineage["init_checkpoint_id"] = prov["init_checkpoint_id"]
+        lineage["parent_checkpoint_id"] = prov["init_checkpoint_id"]
+        lineage["init_checkpoint_sha256"] = prov["init_checkpoint_sha256"]
+        lineage["parent_checkpoint_sha256"] = prov["init_checkpoint_sha256"]
+        lineage["optimizer_reset"] = True
+        target_model.load_state_dict(getattr(model, "module", model).state_dict())
+    elif resume_checkpoint:
+        lineage.update(
+            _restore_stage4_resume_state(
+                checkpoint_path=resume_checkpoint,
+                model=model,
+                optimizer=opt_q,
+                target_model=target_model,
+                replay_buffer=replay_buffer,
+                rollout_rng=rollout_rng,
+                replay_rng=replay_rng,
+                runtime=runtime,
+                device=device,
+                steps=total_steps,
+                batch_size=batch_size,
+                n_cards=n_cards,
+                lr=lr,
+                seed=seed,
+            )
+        )
+        start_step = int(lineage["next_stage_step"])
+        msg = (
+            f"resume Stage4: checkpoint completed_step={lineage['resumed_stage_step_completed']} "
+            f"-> continuing at step={start_step} / {total_steps}"
+        )
+        if runtime.is_rank0:
+            if logger is not None:
+                logger.resume_stage(
+                    "stage4_robust_rl",
+                    completed_step=int(lineage["resumed_stage_step_completed"]),
+                    next_step=start_step,
+                    total_steps=total_steps,
+                    checkpoint=resume_checkpoint,
+                )
+            else:
+                print(msg)
+    else:
+        target_model.load_state_dict(getattr(model, "module", model).state_dict())
+    if start_step > total_steps:
+        raise RuntimeError(
+            f"Stage4 resume checkpoint is beyond requested total steps: "
+            f"next_stage_step={start_step}, steps={total_steps}"
+        )
+    target_model.eval()
+    if runtime.is_distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[runtime.local_rank] if device.startswith("cuda") else None,
+            static_graph=True,
+        )
     last_q = last_actor = last_entropy = 0.0
     last_regret_scale = last_min_logit = last_max_logit = last_logit_gap = 0.0
     last_grad_norm = 0.0
@@ -1019,8 +1338,9 @@ def run_stage4_robust_rl(
     curriculum_path = Path(out_dir) / "curriculum" / "stage4_manifest.json"
     if runtime.is_rank0:
         curriculum_path.parent.mkdir(parents=True, exist_ok=True)
-        curriculum_path.write_text(json.dumps(curriculum.manifest(steps=int(steps)), indent=2, ensure_ascii=False), encoding="utf-8")
-    for step in range(int(steps)):
+        curriculum_path.write_text(json.dumps(curriculum.manifest(steps=total_steps), indent=2, ensure_ascii=False), encoding="utf-8")
+    stage_step_completed = start_step - 1
+    for step in range(start_step, total_steps):
         cstep = curriculum.at(step)
         collector = getattr(model, "module", model)
         collector.eval()
@@ -1145,11 +1465,11 @@ def run_stage4_robust_rl(
             last_min_logit = float(finite_logits.min().detach().cpu())
             last_max_logit = float(finite_logits.max().detach().cpu())
             last_logit_gap = last_max_logit - last_min_logit
-        if logger is not None and _should_log_step(step, int(steps)):
+        if logger is not None and _should_log_step(step, total_steps):
             logger.step_metrics(
                 "stage4_robust_rl",
                 step,
-                int(steps),
+                total_steps,
                 {
                     "q": last_q,
                     "actor": last_actor,
@@ -1165,6 +1485,55 @@ def run_stage4_robust_rl(
                     "neurd_logit_threshold": NEURD_LOGIT_THRESHOLD,
                 },
             )
+        stage_step_completed = step
+        should_save_resume = (
+            int(resume_checkpoint_interval) > 0
+            and ((step + 1) % int(resume_checkpoint_interval) == 0 or step == total_steps - 1)
+        )
+        if should_save_resume:
+            rng_state_by_rank = _gather_stage4_rng_state_by_rank(
+                runtime=runtime,
+                device=device,
+                rollout_rng=rollout_rng,
+                replay_rng=replay_rng,
+            )
+            save_result = None
+            if runtime.is_rank0:
+                try:
+                    resume_path = Path(out_dir) / "stage4_resume_latest.pt"
+                    manifest = _write_stage4_resume_checkpoint(
+                        path=resume_path,
+                        model=model,
+                        optimizer=opt_q,
+                        target_model=target_model,
+                        stage_step_completed=stage_step_completed,
+                        total_steps=total_steps,
+                        stage_metrics={
+                            "q_loss_last": last_q,
+                            "actor_loss_last": last_actor,
+                            "entropy_last": last_entropy,
+                            "stage_step_completed": float(stage_step_completed),
+                            "next_stage_step": float(stage_step_completed + 1),
+                        },
+                        config=resume_config,
+                        lineage=lineage,
+                        replay_buffer=replay_buffer,
+                        curriculum=curriculum,
+                        rng_state_by_rank=rng_state_by_rank,
+                    )
+                    save_result = {"ok": True, "manifest": manifest}
+                    if logger is not None:
+                        logger.checkpoint_saved(
+                            "stage4_resume",
+                            manifest["path"],
+                            global_step=stage_step_completed + 1,
+                            sha256=manifest["sha256"],
+                        )
+                except Exception as exc:
+                    save_result = {"ok": False, "error": repr(exc)}
+            save_result = broadcast_object(save_result, src=0)
+            if not save_result or not save_result.get("ok"):
+                raise RuntimeError(f"Stage4 periodic resume checkpoint failed: {save_result}")
 
     stage_metrics = {
         "q_loss_last": last_q,
@@ -1195,58 +1564,69 @@ def run_stage4_robust_rl(
         "global_rollout_batch_size": float(batch_size),
         "per_rank_rollout_batch_size": float(_rank_shard_range(batch_size, runtime.rank, runtime.world_size)[1]),
         "target_network_ema": 0.995,
-        "curriculum_final_n": float(curriculum.at(max(0, int(steps) - 1)).n_cards),
+        "curriculum_final_n": float(curriculum.at(max(0, total_steps - 1)).n_cards),
+        "start_stage_step": float(start_step),
+        "stage_step_completed": float(stage_step_completed),
+        "next_stage_step": float(stage_step_completed + 1),
+        "resumed_stage_step_completed": float(lineage.get("resumed_stage_step_completed", -1)),
+        "same_world_size_resume_required": 1.0,
     }
+    if stage_step_completed + 1 != total_steps:
+        stage_metrics["stage_incomplete"] = 1.0
     promotion = evaluate_promotion_candidate(stage_metrics)
     checkpoint_path = None
     promotion_artifact = None
+    final_save_result = None
     if runtime.is_rank0:
-        ckpt = Path(out_dir) / "stage4_robust_rl.pt"
-        promotion_artifact = write_promotion_report(promotion, Path(out_dir) / "promotion" / "stage4_promotion.json")
-        manifest = save_checkpoint(
-            ckpt,
-            model=getattr(model, "module", model),
-            optimizers={"robust_rl": opt_q},
-            metadata=CheckpointMetadata(
+        try:
+            ckpt = Path(out_dir) / "stage4_robust_rl.pt"
+            promotion_artifact = write_promotion_report(promotion, Path(out_dir) / "promotion" / "stage4_promotion.json")
+            manifest = save_checkpoint(
+                ckpt,
+                model=getattr(model, "module", model),
+                optimizers={"robust_rl": opt_q},
+                metadata=CheckpointMetadata(
                 checkpoint_id="stage4_robust_rl",
                 training_stage="P4_ROBUST_RL",
-                global_step=int(steps),
+                global_step=total_steps,
                 policy_version=2,
-                config={
-                    "steps": steps,
-                    "batch_size": batch_size,
-                    "global_training_batch_size": batch_size,
-                    "global_rollout_batch_size": batch_size,
-                    "per_rank_rollout_rule": "contiguous shard of global_rollout_batch_size",
-                    "n_cards": n_cards,
-                    "lr": lr,
-                    "seed": seed,
-                    "world_size": runtime.world_size,
-                    "rank_seed_rule": "seed + rank",
-                    "replay_semantics": "rank0_global_replay_sample_then_broadcast_to_all_ranks",
-                    "neurd_logit_threshold": NEURD_LOGIT_THRESHOLD,
-                    "neurd_threshold_step_size": lr,
-                },
-                metrics=stage_metrics,
-                parent_checkpoint_id=lineage["parent_checkpoint_id"],
-                init_checkpoint_id=lineage["init_checkpoint_id"],
-                parent_checkpoint_sha256=lineage.get("parent_checkpoint_sha256"),
-                model_config_hash=model_config_hash(getattr(model, "module", model)),
+                config=resume_config,
+                    metrics=stage_metrics,
+                    parent_checkpoint_id=lineage["parent_checkpoint_id"],
+                    init_checkpoint_id=lineage["init_checkpoint_id"],
+                    parent_checkpoint_sha256=lineage.get("parent_checkpoint_sha256"),
+                    model_config_hash=model_config_hash(getattr(model, "module", model)),
                 optimizer_reset=lineage["optimizer_reset"],
             ),
-            extra={
-                "replay_path": str(replay_buffer.path),
-                "event_log": str(event_sink.path if event_sink is not None else ""),
-                "curriculum": str(curriculum_path),
-                "promotion": promotion_artifact,
-                "target_model_state": target_model.state_dict(),
-            },
-        )
-        registry = CheckpointRegistry(Path(out_dir) / "registry")
-        registry.register("latest", ckpt, global_step=int(steps), metrics=stage_metrics)
-        checkpoint_path = manifest["path"]
-        if logger is not None:
-            logger.checkpoint_saved("stage4_robust_rl", checkpoint_path, global_step=int(steps))
+                extra={
+                    "checkpoint_kind": "stage4_final_boundary",
+                    "stage_step_completed": int(stage_step_completed),
+                    "next_stage_step": int(stage_step_completed + 1),
+                    "total_steps": int(total_steps),
+                    "resume_source_checkpoint_id": lineage.get("resume_checkpoint_id"),
+                    "resume_source_sha256": lineage.get("resume_sha256"),
+                    "resumed_stage_step_completed": lineage.get("resumed_stage_step_completed"),
+                    "restored_replay_samples": lineage.get("restored_replay_samples"),
+                    "replay_path": str(replay_buffer.path),
+                    "event_log": str(event_sink.path if event_sink is not None else ""),
+                    "curriculum": str(curriculum_path),
+                    "promotion": promotion_artifact,
+                    "target_model_state": target_model.state_dict(),
+                    "target_model_sha256": state_dict_sha256(target_model.state_dict()),
+                },
+                atomic=True,
+            )
+            registry = CheckpointRegistry(Path(out_dir) / "registry")
+            registry.register("latest", ckpt, global_step=total_steps, metrics=stage_metrics)
+            checkpoint_path = manifest["path"]
+            if logger is not None:
+                logger.checkpoint_saved("stage4_robust_rl", checkpoint_path, global_step=total_steps)
+            final_save_result = {"ok": True, "manifest": manifest}
+        except Exception as exc:
+            final_save_result = {"ok": False, "error": repr(exc)}
+    final_save_result = broadcast_object(final_save_result, src=0)
+    if not final_save_result or not final_save_result.get("ok"):
+        raise RuntimeError(f"Stage4 final checkpoint failed: {final_save_result}")
     barrier_if_distributed()
     stage_metrics["promotion_candidate"] = 1.0 if promotion.decision == "PROMOTE_CANDIDATE" else 0.0
     payload = {

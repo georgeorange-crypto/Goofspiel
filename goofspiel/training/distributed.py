@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 import random
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +78,24 @@ def torchrun_command(
     steps: int,
     batch_size: int,
     n_cards: int = 13,
+    rdzv_id: str | None = None,
 ) -> list[str]:
     validate_stage_sequence([stage])
+    # Stage5's control-plane derives a per-LAUNCH identity from
+    # ``TORCHELASTIC_RUN_ID`` so a re-run into the same artifact-dir cannot
+    # accept a previous launch's stale terminal status (see ``stage_control``).
+    # Under torchrun's STATIC rendezvous (``--master_addr``/``--master_port``,
+    # which this command uses) ``--rdzv-id`` defaults to the constant string
+    # ``"none"`` — so WITHOUT an explicit id every fresh launch would share the
+    # same RUN_ID and the stale-terminal guard would be defeated.  We therefore
+    # inject a fresh per-launch ``--rdzv-id`` (a uuid4 unless the caller pins
+    # one); torchrun then propagates it verbatim into ``TORCHELASTIC_RUN_ID`` on
+    # every rank, restoring cross-launch uniqueness while keeping the static
+    # rendezvous topology unchanged.  ``stage_control.current_invocation_id``
+    # additionally treats a ``"none"`` RUN_ID as "no id supplied" and fails
+    # closed, so a launch that forgets this flag is caught loudly, never
+    # silently.
+    run_id = rdzv_id if rdzv_id is not None else str(uuid.uuid4())
     return [
         "torchrun",
         "--nnodes",
@@ -89,6 +106,8 @@ def torchrun_command(
         config.master_addr,
         "--master_port",
         str(config.master_port),
+        "--rdzv-id",
+        run_id,
         str(Path("scripts") / "train_goofspiel_full.py"),
         "--artifact-dir",
         config.artifact_dir,

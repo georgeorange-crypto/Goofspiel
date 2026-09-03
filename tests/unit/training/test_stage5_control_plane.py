@@ -308,6 +308,58 @@ def test_invocation_id_distinguishes_restart_generations(monkeypatch):
     assert gen1 != gen0_rank0  # generation N rejects generation N-1's record
 
 
+def test_invocation_id_rejects_static_rdzv_none_sentinel(monkeypatch):
+    """Regression for the HPDPS-4 2xH100 NCCL gate finding (2026-09-03).
+
+    Under torchrun's STATIC rendezvous (``--master_addr``/``--master_port`` with
+    no ``--rdzv-id``), ``TORCHELASTIC_RUN_ID`` is the CONSTANT string ``"none"``
+    — not a per-launch uuid.  If ``current_invocation_id`` trusted it, every
+    fresh launch into the same artifact-dir would share ``torchelastic:none:r0``
+    and a re-run's peer would accept the PRIOR launch's stale SUCCESS — exactly
+    the stale-terminal race this identity exists to prevent.  So ``"none"``
+    (case-insensitively) MUST be treated like "unset": fall back to a
+    per-process uuid, which makes peers disagree and FAIL CLOSED rather than
+    silently trust a foreign record.  (``torchrun_command`` injects a real
+    per-launch ``--rdzv-id`` so this fallback never triggers in the intended
+    config — it is the loud-failure backstop for a launch that forgets it.)
+    """
+    monkeypatch.delenv("TORCHELASTIC_RESTART_COUNT", raising=False)
+    for sentinel in ("none", "None", "NONE"):
+        monkeypatch.setenv("TORCHELASTIC_RUN_ID", sentinel)
+        a = current_invocation_id()
+        b = current_invocation_id()  # a "second rank" in the same broken launch
+        assert a.startswith("pid:"), f"{sentinel!r} must not become a shared torchelastic id"
+        assert "none" not in a  # never emit torchelastic:none:...
+        assert a != b  # per-process -> peers disagree -> fail closed
+    # Empty / whitespace RUN_ID is likewise "no id supplied".
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "   ")
+    assert current_invocation_id().startswith("pid:")
+
+
+def test_torchrun_command_injects_unique_rdzv_id():
+    """The launch-side half of the fix: ``torchrun_command`` must inject a
+    ``--rdzv-id`` so static rendezvous does not fall back to the ``"none"``
+    sentinel.  It is a fresh uuid per call (per launch) unless pinned, and it is
+    passed to torchrun BEFORE the training script so torchrun (not the script)
+    consumes it."""
+    from goofspiel.training.distributed import DistributedTrainingConfig, torchrun_command
+
+    cfg = DistributedTrainingConfig(num_nodes=1, gpus_per_node=2)
+    cmd_a = torchrun_command(cfg, stage="stage4_robust_rl", steps=10, batch_size=8, n_cards=5)
+    cmd_b = torchrun_command(cfg, stage="stage4_robust_rl", steps=10, batch_size=8, n_cards=5)
+    assert "--rdzv-id" in cmd_a
+    id_a = cmd_a[cmd_a.index("--rdzv-id") + 1]
+    id_b = cmd_b[cmd_b.index("--rdzv-id") + 1]
+    assert id_a and id_a.lower() != "none"
+    assert id_a != id_b  # fresh per launch -> distinct RUN_ID -> distinct invocation id
+    # --rdzv-id must precede the script path (a torchrun arg, not a script arg).
+    script_idx = next(i for i, tok in enumerate(cmd_a) if tok.endswith("train_goofspiel_full.py"))
+    assert cmd_a.index("--rdzv-id") < script_idx
+    # An explicit id is honored verbatim (lets a caller pin one for testing).
+    pinned = torchrun_command(cfg, stage="stage4_robust_rl", steps=10, batch_size=8, n_cards=5, rdzv_id="pinned-xyz")
+    assert pinned[pinned.index("--rdzv-id") + 1] == "pinned-xyz"
+
+
 def test_disabled_heartbeat_writes_nothing(tmp_path: Path):
     """Single-process runs must be side-effect identical to the old code."""
     cd = control_dir_for(tmp_path)

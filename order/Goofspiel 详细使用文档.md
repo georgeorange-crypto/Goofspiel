@@ -880,7 +880,9 @@ python scripts/plan_h200_training.py --gpus-per-node 8 --steps 100000 --batch-si
 正式训练由你在服务器上按阶段执行。例如 P4 主 RL 阶段：
 
 ```bash
-torchrun --nnodes 1 --nproc_per_node 8 scripts/train_goofspiel_full.py \
+torchrun --nnodes 1 --nproc_per_node 8 \
+  --rdzv-id "$(cat /proc/sys/kernel/random/uuid)" \
+  scripts/train_goofspiel_full.py \
   --artifact-dir artifacts/runs/h200_full \
   --stage stage4_robust_rl \
   --steps 100000 \
@@ -889,7 +891,7 @@ torchrun --nnodes 1 --nproc_per_node 8 scripts/train_goofspiel_full.py \
   --device cuda
 ```
 
-`torchrun` 下训练代码会读取 `RANK/WORLD_SIZE/LOCAL_RANK`，用 DDP 包装神经模型，只有 rank0 保存 checkpoint。这样不会出现 8 个进程同时覆盖同一个 checkpoint 的问题。
+`torchrun` 下训练代码会读取 `RANK/WORLD_SIZE/LOCAL_RANK`，用 DDP 包装神经模型，只有 rank0 保存 checkpoint。这样不会出现 8 个进程同时覆盖同一个 checkpoint 的问题。**`--rdzv-id` 每次启动必须唯一**（示例用随机 uuid）：Stage5 控制面据此区分本次启动与同一 artifact-dir 里上一次遗留的 `status.json`。静态 rendezvous（`--master_addr/--master_port` 或默认）下 `--rdzv-id` 缺省是常量 `"none"`，不传则重跑会误认上一次 SUCCESS、重开 Stage5 分布式死锁竞态；忘传时 Stage5 fail-closed 明确报错，不静默复现。
 
 本机只做轻量正确性验证：
 

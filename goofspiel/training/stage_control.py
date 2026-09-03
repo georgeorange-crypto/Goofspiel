@@ -133,9 +133,15 @@ def current_invocation_id() -> str:
     exactly that:
 
       * ``TORCHELASTIC_RUN_ID`` is set identically in every rank's environment
-        and equals the rendezvous id, which torchrun auto-assigns as a fresh
-        ``uuid4`` per launch when ``--rdzv-id`` is not passed (it is not, in
-        ``torchrun_command``).  It distinguishes one *launch* from another.
+        and equals the rendezvous id.  IMPORTANT: under torchrun's *static*
+        rendezvous (``--master_addr``/``--master_port``, which the production
+        ``torchrun_command`` uses) ``--rdzv-id`` is NOT auto-assigned a uuid —
+        it defaults to the constant string ``"none"``, so every fresh launch
+        would otherwise share that one RUN_ID and defeat this whole guard
+        (verified on the real launcher; a fresh uuid4 is auto-assigned only
+        under ``--standalone`` / c10d rendezvous).  ``torchrun_command`` fixes
+        this by injecting a fresh per-launch ``--rdzv-id``; this function is the
+        BACKSTOP for a launch that forgets to — see below.
       * ``TORCHELASTIC_RESTART_COUNT`` distinguishes one *restart-generation*
         from the next WITHIN a launch.  torchelastic keeps ``RUN_ID`` stable
         across a worker-group restart and only bumps this counter, and it
@@ -149,15 +155,21 @@ def current_invocation_id() -> str:
     launch OR a later restart of the same launch gets a different one — for
     free, from the env, no collective.
 
-    If ``RUN_ID`` is absent (not launched under torchrun), we fall back to a
+    If ``RUN_ID`` is absent, empty, or the static-rendezvous sentinel
+    ``"none"`` (i.e. no real per-launch id reached us), we fall back to a
     per-PROCESS uuid.  That deliberately makes peers disagree, so a peer treats
     any pre-existing status as foreign and FAILS CLOSED rather than trusting a
     record it cannot prove belongs to this invocation.  A run that is genuinely
     single-process never reaches the poller (the heartbeat is disabled and no
-    peer waits), so the fallback only ever hardens, never harms.
+    peer waits), so the fallback only ever hardens, never harms — and a
+    *distributed* launch that forgot ``--rdzv-id`` fails fast and loudly instead
+    of silently re-opening the stale-terminal race.
     """
     run_id = os.environ.get("TORCHELASTIC_RUN_ID", "").strip()
-    if run_id:
+    # ``"none"`` is torchrun's literal default for ``--rdzv-id`` under static
+    # rendezvous (NOT a real id): treat it exactly like "unset" so we fall
+    # through to the fail-closed per-process fallback.
+    if run_id and run_id.lower() != "none":
         # RESTART_COUNT is per worker-group restart; default 0 if unset (e.g. a
         # launcher that sets RUN_ID but not the counter).  A non-integer value
         # is passed through verbatim rather than crashing the id derivation.

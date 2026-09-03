@@ -10,6 +10,7 @@ from typing import Any
 
 from .corpus import generate_random_game_corpus
 from .distributed import STAGE_SEQUENCE, broadcast_object, current_runtime, barrier_if_distributed
+from .budgets import coerce_budgets
 from .league import ROLE_AGGRESSIVE, ROLE_EXPLOITER, ROLE_ROBUST
 from .stage_control import DEFAULT_HARD_TIMEOUT_S, DEFAULT_HEARTBEAT_TIMEOUT_S
 from ..observability import TrainingLogger
@@ -177,6 +178,18 @@ class TrainingCoordinator:
             )
         return ckpt
 
+    def _budgets(self):
+        """Resolve the stage budget tree ONCE for this run.
+
+        Reads ``config.extra["budgets"]`` — an ``asdict(StageBudgets)`` mapping
+        the CLI stored (or a live ``StageBudgets``, or nothing).  ``coerce_budgets``
+        falls back to the SMOKE profile with the legacy ``--steps`` value when no
+        budget was supplied, so every existing config (which carries no budgets)
+        behaves exactly as before.
+        """
+        raw = self.config.extra.get("budgets") if isinstance(self.config.extra, dict) else None
+        return coerce_budgets(raw, steps_fallback=int(self.config.steps))
+
     def _dispatch_stage(
         self,
         stage: str,
@@ -320,6 +333,8 @@ class TrainingCoordinator:
                 role_checkpoints=role_checkpoints or None,
                 n_cards=self.config.n_cards,
                 seed=self.config.seed,
+                budget=self._budgets().stage6,
+                profile_name=self._budgets().profile,
             )
             result = {"stage": stage, "ok": True, "metrics": asdict(metrics)}
             result["role_checkpoints"] = role_checkpoints
@@ -339,6 +354,9 @@ class TrainingCoordinator:
                 init_from_checkpoint=init_p4,
                 n_cards=self.config.n_cards,
                 seed=self.config.seed,
+                correction_steps=self._budgets().stage7.correction_steps,
+                budget=self._budgets().stage7,
+                profile_name=self._budgets().profile,
             )
             result = {"stage": stage, "ok": True, "metrics": asdict(metrics)}
             result["init_from_checkpoint"] = init_p4
@@ -355,8 +373,15 @@ class TrainingCoordinator:
                 )
             else:
                 eval_ckpt = self._resolve_checkpoint("stage4_robust_rl", produced)
+            budgets = self._budgets()
+            eval_seeds = [int(self.config.seed) + i for i in range(int(budgets.evaluate.seeds))]
             payload = run_evaluation_suite(
-                out_dir=self.artifact_dir, num_games=16, checkpoint=eval_ckpt, seed=self.config.seed
+                out_dir=self.artifact_dir,
+                num_games=int(budgets.evaluate.games_per_matchup),
+                seeds=eval_seeds,
+                checkpoint=eval_ckpt,
+                seed=self.config.seed,
+                profile_name=budgets.profile,
             )
             result = {"stage": stage, "ok": True, "metrics": payload}
             result["evaluated_checkpoint"] = eval_ckpt

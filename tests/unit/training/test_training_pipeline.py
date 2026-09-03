@@ -147,7 +147,21 @@ def test_stage7_writes_redteam_reanalysis(tmp_path: Path):
     assert metrics["failures"] == 3.0
     assert metrics["corrections"] == 3.0
     assert metrics["teacher_relabels"] == 3.0
-    assert metrics["focused_correction_steps"] == 3.0
+    # Section 8 mislabel FIX: focused_correction_steps now reports the REAL
+    # optimizer-loop count (range(correction_steps)), NOT the 3-attack count.
+    # RE-EXECUTE the fact instead of trusting the metric: reload the corrected
+    # checkpoint's bytes and assert its persisted global_step (= the number of
+    # optimizer steps actually run) equals both the fixed key and its new alias.
+    from goofspiel.training.checkpoint import load_checkpoint
+
+    corrected = tmp_path / "stage7" / "redteam" / "stage7_corrected.pt"
+    global_step = int(load_checkpoint(corrected)["metadata"]["global_step"])
+    assert metrics["focused_correction_steps"] == float(global_step)
+    assert metrics["correction_optimizer_steps"] == float(global_step)
+    assert metrics["focused_correction_steps"] == metrics["correction_optimizer_steps"]
+    # On the SMOKE path the coordinator resolves stage7 correction_steps to 40,
+    # so the mislabel (which reported 3.0) is genuinely gone.
+    assert global_step == 40
     # Phase 4.4: a real focused correction now runs, so the regression pass/fail
     # metrics are MEASURED (0.0/1.0), no longer absent. They must be present and
     # valued, and the correction must not degrade the attack match-rate.

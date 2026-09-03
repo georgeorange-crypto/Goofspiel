@@ -28,13 +28,129 @@ ARENAS = (
     "E7_LEAGUE_REDTEAM",
 )
 
+# Phase 0 — three-state gate semantics.  A hard gate is one of:
+#   * True   -> a real check RAN and PASSED
+#   * False  -> a real check RAN and FAILED
+#   * None   -> the check did NOT RUN (no evaluator computed it yet)
+# ``None`` must never be rendered or counted as a FAIL.  These labels are the
+# single source of truth for turning a gate value into human-readable text.
+GATE_PASS = "PASS"
+GATE_FAIL = "FAIL"
+GATE_NOT_RUN = "NOT_RUN"
+
+# Promotion decisions.  A *binding* PROMOTE/REJECT may be emitted only by the
+# FULL profile with every REQUIRED gate actually run (see REQUIRED_HARD_GATES);
+# SMOKE and QUICK are non-binding smoke profiles and never certify
+# (NOT_EVALUATED), and a FULL run that left a required gate unrun is INCOMPLETE.
+PROMOTION_PROMOTE = "PROMOTE_CANDIDATE"
+PROMOTION_REJECT = "REJECT_CANDIDATE"
+PROMOTION_INCOMPLETE = "INCOMPLETE"
+PROMOTION_NOT_EVALUATED = "NOT_EVALUATED"
+
+# Arena v1 delta #12 — the default evaluate profile is reclassified QUICK -> SMOKE.
+# This note is recorded VERBATIM (the plan requires the exact wording) so the
+# intent is unambiguous in the artifact and the source: the workload did not
+# shrink, only its promotion authority did.
+QUICK_TO_SMOKE_MIGRATION_NOTE = (
+    "Legacy default workload is preserved, while the profile is intentionally "
+    "reclassified from QUICK to SMOKE so that smoke runs cannot produce binding "
+    "promotion conclusions."
+)
+
+# Arena v1 delta #13 — the hard gates REQUIRED for a binding certification.  A
+# FULL run may emit PROMOTE/REJECT only when EVERY gate in this set actually ran
+# (is non-None); if any is NOT_RUN the run is INCOMPLETE, never a REJECT.  There
+# is deliberately NO "required subset" smaller than the whole: certifying a model
+# whose historical / regression / calibration / safety / performance gates were
+# never evaluated would be an overclaim.  So a live FULL run is honestly
+# INCOMPLETE until the evaluators for G1/G3..G7 land — that is correct, not a bug.
+REQUIRED_HARD_GATES = (
+    "G0_integrity",
+    "G1_exact_regression",
+    "G2_exploitability",
+    "G3_historical",
+    "G4_regression_suite",
+    "G5_opponent_calibration",
+    "G6_adaptive_safety",
+    "G7_numerical_performance",
+)
+
+
+def gate_label(value: bool | None) -> str:
+    """Map a tri-state gate value to its PASS / FAIL / NOT_RUN label.
+
+    ``None`` (a gate no evaluator computed) is NOT_RUN — never FAIL.  This is the
+    bug Phase 0 fixes: ``'PASS' if value else 'FAIL'`` silently collapsed the
+    unrun state (falsy ``None``) into FAIL.
+    """
+    if value is None:
+        return GATE_NOT_RUN
+    return GATE_PASS if value else GATE_FAIL
+
 
 @dataclass
 class EvaluationProfile:
-    name: str = "QUICK"
+    # Arena v1 delta #12: the default is SMOKE, not QUICK.  SMOKE keeps the legacy
+    # 16-games/3-seeds workload but carries no promotion authority (NOT_EVALUATED),
+    # so a default-profile run can never be mistaken for a binding certification.
+    # See QUICK_TO_SMOKE_MIGRATION_NOTE for the recorded rationale.
+    name: str = "SMOKE"
     seeds: list[int] = field(default_factory=lambda: [1, 2, 3])
     num_games: int = 16
     include_e7: bool = False
+    # Arena v1 delta #4: the evaluate harness is FIXED-BUDGET on every profile.
+    # It never stops early on a bootstrap CI half-width (mixing optional stopping
+    # with a fixed-sample CI breaks the coverage interpretation).  The evaluate
+    # code has no early-stop path at all, so this field is an enforced guarantee,
+    # not a switch: True is unsupported and rejected below.  (This is independent
+    # of the Stage6 cross-play budget, which owns its own sequential-stop flag.)
+    sequential_ci_stop: bool = False
+
+    def __post_init__(self) -> None:
+        if self.sequential_ci_stop:
+            raise ValueError(
+                "Arena v1 evaluate is fixed-budget (delta #4): sequential_ci_stop "
+                "must be False. The evaluate harness has no early-stop path; enable "
+                "sequential stopping only in the Stage6 cross-play budget, which "
+                "owns that concern separately."
+            )
+
+    @property
+    def emits_binding_promotion(self) -> bool:
+        """Only the FULL profile may emit a binding PROMOTE/REJECT decision.
+
+        SMOKE and QUICK are non-binding evaluation profiles: they report every
+        arena and every gate state, but their promotion decision is always
+        ``NOT_EVALUATED`` — they do not run the gates at the scale (and, for
+        SMOKE, on a formally-trained checkpoint) a real certification requires.
+        """
+        return self.name.strip().upper() == "FULL"
+
+
+def decide_promotion(profile: EvaluationProfile, hard_gates: dict[str, bool | None]) -> str:
+    """Turn tri-state gates into a promotion decision, honouring the profile.
+
+    * SMOKE / QUICK (any non-FULL profile) -> ``NOT_EVALUATED`` (never binding).
+    * FULL with any gate NOT_RUN (None) -> ``INCOMPLETE`` (cannot certify).
+    * FULL with every gate run and all PASS -> ``PROMOTE_CANDIDATE``.
+    * FULL with every gate run and any FAIL -> ``REJECT_CANDIDATE``.
+
+    Every gate present in ``hard_gates`` is treated as required: ``all(...)`` /
+    ``any(... is None)`` range over the whole dict.  The delta #13 "required
+    gates" concept is therefore expressed by WHICH gates the caller places in the
+    dict — :func:`run_unified_benchmark` passes all of :data:`REQUIRED_HARD_GATES`
+    — not by a subset filter here.  There is deliberately no smaller required set:
+    a NOT_RUN gate is never treated as a FAIL (it blocks certification, turning a
+    FULL run INCOMPLETE, but is not itself a rejection), and no gate may be
+    silently waived to force a PROMOTE.
+    """
+    if not profile.emits_binding_promotion:
+        return PROMOTION_NOT_EVALUATED
+    if any(value is None for value in hard_gates.values()):
+        return PROMOTION_INCOMPLETE
+    if all(value is True for value in hard_gates.values()):
+        return PROMOTION_PROMOTE
+    return PROMOTION_REJECT
 
 
 @dataclass
@@ -43,11 +159,18 @@ class BenchmarkReport:
     schema_version: str
     profile: EvaluationProfile
     arenas: dict[str, dict[str, Any]]
-    hard_gates: dict[str, bool]
+    # Tri-state: True=PASS, False=FAIL, None=NOT_RUN.  Never collapse None to FAIL.
+    hard_gates: dict[str, bool | None]
     promotion_decision: str
 
 
-def _matrix_matching_pennies_gap() -> float:
+def _matrix_matching_pennies_gap() -> float | None:
+    """Duality gap of the RM+ solver on 2x2 matching pennies.
+
+    Returns the gap when the check actually ran, or ``None`` when it could not
+    run (e.g. torch unavailable).  ``None`` must propagate as NOT_RUN — never be
+    silently coerced to ``0.0``, which would forge a PASS on the E0 gate.
+    """
     try:
         import torch
         from goofspiel.learning.game_theory.regret_matching_plus import solve_batch
@@ -57,7 +180,7 @@ def _matrix_matching_pennies_gap() -> float:
         sol = solve_batch(q, mask, mask, iterations=256)
         return float(sol.duality_gap.mean().detach().cpu())
     except Exception:
-        return 0.0
+        return None
 
 
 def _exact_small_n_summary(max_n: int = 5) -> dict[str, Any]:
@@ -107,6 +230,56 @@ def _seeded_model_matchups(
         "checkpoint": str(checkpoint),
         "checkpoint_id": str(meta.get("checkpoint_id", "")),
     }
+
+
+def _generalization_row(
+    n: int, robust_summary: dict[str, float], *, checkpoint: str | Path | None
+) -> dict[str, Any]:
+    """One E6 generalization row.
+
+    Phase 0 correctness fix: the exploitability field must never be a hard-coded
+    ``0.0``.  When a trained checkpoint is supplied and ``n`` is inside the exact
+    full-game budget, we compute the REAL ``full_game_exploitability`` of the
+    model's robust policy; otherwise the field is ``None`` (NOT_RUN) and carries
+    a status string saying why — never a fabricated zero.
+
+    ``exploitability_kind`` names exactly what the number is so it can never be
+    mistaken for a full-game figure at large N (Phase 0.3 naming discipline).
+    """
+    from goofspiel.training.model_eval import DEFAULT_MAX_FULL_GAME_N
+
+    row: dict[str, Any] = {
+        "n": n,
+        "robust_score": robust_summary["mean_score_diff"],
+        "opp_nll": math.log(n),
+    }
+    if checkpoint is not None and Path(checkpoint).exists() and n <= DEFAULT_MAX_FULL_GAME_N:
+        try:
+            from goofspiel.training.model_eval import (
+                full_game_exploitability,
+                load_model_from_checkpoint,
+                robust_policy_fn,
+            )
+
+            model, _meta = load_model_from_checkpoint(checkpoint)
+            policy = robust_policy_fn(model, greedy=True)
+            exploit = full_game_exploitability(policy, n_cards=n, max_n=DEFAULT_MAX_FULL_GAME_N)
+            row["exploitability"] = exploit
+            row["exploitability_kind"] = "full_game_exact"
+            if exploit is None:
+                row["exploitability_status"] = "not_run_exceeds_exact_budget"
+        except Exception as exc:  # pragma: no cover - surfaced honestly
+            row["exploitability"] = None
+            row["exploitability_kind"] = "not_run"
+            row["exploitability_status"] = f"error:{type(exc).__name__}"
+    else:
+        # No model, or N beyond the exact budget: honestly NOT_RUN, not 0.0.
+        row["exploitability"] = None
+        row["exploitability_kind"] = "not_run"
+        row["exploitability_status"] = (
+            "no_trained_checkpoint" if checkpoint is None else "not_run_exceeds_exact_budget"
+        )
+    return row
 
 
 def _search_compute_summary() -> dict[str, Any]:
@@ -168,11 +341,22 @@ def run_unified_benchmark(
     arenas: dict[str, dict[str, Any]] = {}
     try:
         e0_gap = _matrix_matching_pennies_gap()
-        arenas["E0_MATHEMATICAL_CORRECTNESS"] = {"matrix_matching_pennies_gap": e0_gap, "passed": e0_gap < 0.1}
+        if e0_gap is None:
+            # The check could not run (torch unavailable). NOT_RUN, not FAIL.
+            arenas["E0_MATHEMATICAL_CORRECTNESS"] = {
+                "matrix_matching_pennies_gap": None,
+                "passed": None,
+                "status": "torch_dependent_check_unavailable",
+            }
+        else:
+            arenas["E0_MATHEMATICAL_CORRECTNESS"] = {
+                "matrix_matching_pennies_gap": e0_gap,
+                "passed": e0_gap < 0.1,
+            }
     except Exception as exc:
         arenas["E0_MATHEMATICAL_CORRECTNESS"] = {
             "matrix_matching_pennies_gap": None,
-            "passed": False,
+            "passed": None,
             "status": "torch_import_failed",
             "error": repr(exc),
         }
@@ -207,10 +391,7 @@ def run_unified_benchmark(
             ]
         }
     arenas["E6_GENERALIZATION"] = {
-        "rows": [
-            {"n": n, "robust_score": _robust_at(n)["mean_score_diff"], "exploitability": 0.0, "opp_nll": math.log(n)}
-            for n in (3, 5, 9, 13)
-        ]
+        "rows": [_generalization_row(n, _robust_at(n), checkpoint=checkpoint if have_model else None) for n in (3, 5, 9, 13)]
     }
     if profile.include_e7:
         arenas["E7_LEAGUE_REDTEAM"] = {
@@ -251,7 +432,13 @@ def run_unified_benchmark(
         "G6_adaptive_safety": None,
         "G7_numerical_performance": None,
     }
-    decision = "PROMOTE_CANDIDATE" if all(bool(v) for v in hard_gates.values()) else "REJECT_CANDIDATE"
+    # delta #13: the emitted gate set IS the required set — keep them in lockstep
+    # so a gate can never be quietly dropped from the certification requirement.
+    assert tuple(hard_gates) == REQUIRED_HARD_GATES, (
+        "hard_gates drifted from REQUIRED_HARD_GATES; a required gate must not be "
+        "silently added or removed from the certification requirement"
+    )
+    decision = decide_promotion(profile, hard_gates)
     return BenchmarkReport(
         benchmark_version=BENCHMARK_VERSION,
         schema_version=SCHEMA_VERSION,
@@ -274,10 +461,34 @@ def write_benchmark_report(report: BenchmarkReport, out_dir: str | Path) -> dict
         f"- Benchmark: {report.benchmark_version}",
         f"- Profile: {report.profile.name}",
         f"- Promotion decision: {report.promotion_decision}",
-        "",
-        "## Hard Gates",
     ]
-    lines.extend(f"- {name}: {'PASS' if ok else 'FAIL'}" for name, ok in report.hard_gates.items())
+    # A SMOKE/QUICK/non-FULL profile never certifies; say so plainly so
+    # NOT_EVALUATED is not misread as a failure, and cite the delta #12 migration
+    # note verbatim for the SMOKE default so the reclassification is on the record.
+    if report.promotion_decision == PROMOTION_NOT_EVALUATED:
+        lines.append(
+            f"  - (profile `{report.profile.name}` is a non-binding smoke profile; "
+            "a binding PROMOTE/REJECT is only emitted by the FULL profile)"
+        )
+        if report.profile.name.strip().upper() in ("SMOKE", "QUICK"):
+            lines.append(f"  - migration note: {QUICK_TO_SMOKE_MIGRATION_NOTE}")
+    elif report.promotion_decision == PROMOTION_INCOMPLETE:
+        unrun = [name for name, ok in report.hard_gates.items() if ok is None]
+        detail = f" ({', '.join(unrun)})" if unrun else ""
+        lines.append(
+            "  - (FULL profile, but one or more required gates did not run — "
+            f"cannot certify{detail})"
+        )
+    lines.extend(["", "## Hard Gates", ""])
+    # Phase 0: render the tri-state via ``gate_label`` — NOT_RUN must never show
+    # as FAIL.  ``'PASS' if ok else 'FAIL'`` was the bug (None is falsy).
+    lines.extend(f"- {name}: {gate_label(ok)}" for name, ok in report.hard_gates.items())
+    if any(v is None for v in report.hard_gates.values()):
+        lines.append("")
+        lines.append(
+            "> NOT_RUN means no evaluator computed that gate yet — it is neither a "
+            "pass nor a failure, and does not by itself reject a candidate."
+        )
     lines.append("")
     lines.append("## Baselines")
     lines.extend(f"- {b.name}: {b.tier} / {b.arena} / {b.entrypoint}" for b in default_baselines())

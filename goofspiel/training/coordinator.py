@@ -273,6 +273,7 @@ class TrainingCoordinator:
             metrics = run_stage5_adaptive(
                 steps=self.config.steps,
                 out_dir=self.artifact_dir,
+                device=self.config.device,
                 n_cards=self.config.n_cards,
                 seed=self.config.seed,
                 init_from_checkpoint=init_from_checkpoint,

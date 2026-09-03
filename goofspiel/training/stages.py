@@ -1826,6 +1826,7 @@ def run_stage5_adaptive(
     *,
     steps: int,
     out_dir: str | Path,
+    device: str = "cpu",
     n_cards: int = 5,
     lr: float = 3e-4,
     seed: int = 1,
@@ -1853,7 +1854,13 @@ def run_stage5_adaptive(
     last-resort fake-alive guard for a rank0 that keeps heartbeating but never
     terminates.  NCCL's own timeout stays purely low-level fault protection.
     """
-    runtime, _ = setup_torch_distributed("auto")
+    # Phase 2: resolve the device from the caller (coordinator passes
+    # ``config.device``) instead of discarding it — this is the single lever
+    # that moves the rank0 adaptive model + training tensors CPU -> cuda.  The
+    # rebind mirrors every sibling stage (``runtime, device = ...``); default
+    # "cpu" keeps single-process/local behaviour byte-identical.  It does NOT
+    # DDP-wrap Stage5 (still rank0-only) and does NOT touch the control-plane.
+    runtime, device = setup_torch_distributed(device)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     control_dir = control_dir_for(out)
@@ -1897,6 +1904,7 @@ def run_stage5_adaptive(
         stage_metrics, ckpt_path = _run_stage5_adaptive_rank0(
             steps=steps,
             out=out,
+            device=device,
             n_cards=n_cards,
             lr=lr,
             seed=seed,
@@ -1920,6 +1928,7 @@ def _run_stage5_adaptive_rank0(
     *,
     steps: int,
     out: Path,
+    device: str,
     n_cards: int,
     lr: float,
     seed: int,
@@ -1990,7 +1999,7 @@ def _run_stage5_adaptive_rank0(
         session_rows.append(session)
     rounds_total = sum(len(g) for s in session_rows for g in s.games)
 
-    model = GoofspielModel(max_cards=13).to("cpu")
+    model = GoofspielModel(max_cards=13).to(device)
     model.assert_partition_is_complete()
     opt = torch.optim.AdamW(model.adaptive_parameters(), lr=lr)
     lineage = _apply_init_or_resume(
@@ -2002,7 +2011,11 @@ def _run_stage5_adaptive_rank0(
     model.set_robust_requires_grad(False)
 
     heartbeat.running(step=0, phase="tensor_build", force=True)
-    tensors = _build_adaptive_training_tensors(session_rows, max_cards=13, device="cpu")
+    # Phase 2: build the nested public-state / history / memory tensors NATIVELY
+    # on the target device.  A post-hoc ``batch.to(device)`` does NOT work — the
+    # nested public-state tensors don't move recursively (verified device
+    # mismatch), so device must be threaded to the source constructor.
+    tensors = _build_adaptive_training_tensors(session_rows, max_cards=13, device=device)
     if tensors is None:
         raise RuntimeError("P5 produced no training rows from the opponent sessions")
     batch, history, memory, target_t, n_cards_row = tensors

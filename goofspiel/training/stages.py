@@ -3136,9 +3136,15 @@ def run_stage7_redteam(
     batch = public_state_from_game(train_states, max_cards=13)
     target_q, q_mask = _immediate_target(train_states, 13)
     teacher_policy = torch.zeros(len(train_states), 13)
-    for b, sample in enumerate(train_samples):
-        for i, v in enumerate((sample.teacher_policy or [])[:13]):
-            teacher_policy[b, i] = float(v)
+    # sample.teacher_policy is ordered by state.self_actions (it is the row of
+    # solve_zero_sum_matrix over legal_cards), while the model policy tensors
+    # (robust_policy_logits, its -1e9 legality mask, robust_policy_fn, and the
+    # _immediate_target Q target) are globally VALUE-slotted: slot k corresponds to
+    # card value k+1. Pack by card value so the KL target lands on the same slot the
+    # policy head is scored on. (Positional == value only for contiguous-from-1 masks.)
+    for b, (sample, state) in enumerate(zip(train_samples, train_states)):
+        for card, prob in zip(state.self_actions, sample.teacher_policy or []):
+            teacher_policy[b, card - 1] = float(prob)
     teacher_policy = teacher_policy / teacher_policy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     model.train()

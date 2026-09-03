@@ -1,38 +1,46 @@
-"""S7-D1 — Stage7 `focused_correction` failure DIAGNOSIS (committed evidence).
+"""S7-D1/F1 -- Stage7 `focused_correction` teacher-policy slotting (diagnosis + FIX).
 
-These tests pin the CONFIRMED root cause of the rerun567 correction regression:
-the focused-correction POLICY target is packed **positionally** over the legal
-cards (`stages.py:3138-3142`) while every other action vector in the pipeline —
-`robust_policy_logits`, its legality mask, the `robust_policy_fn` decoder, and
-the correction's own Q target `_immediate_target` — is **value-slotted**
-(slot k ⟷ card value k+1). On any legal mask that is not contiguous-from-1
-("gapped"), the teacher's probability mass lands on the wrong logit slot, so the
-KL objective pushes probability AWAY from the teacher's true card.
+S7-D1 CONFIRMED the root cause of the rerun567 correction regression: the
+focused-correction POLICY target was packed *positionally* over the legal cards
+(old stages.py:3138-3142) while every other action vector in the pipeline --
+`robust_policy_logits`, its legality mask, the `robust_policy_fn` decoder, and the
+correction's own Q target `_immediate_target` -- is *value-slotted* (slot k <-> card
+value k+1). On any legal mask that is not contiguous-from-1 ("gapped") the teacher's
+probability mass landed on the wrong logit slot, so the KL objective pushed
+probability AWAY from the teacher's true card.
 
-Evidence grade (S7-D1 §43): every assertion below RE-EXECUTES the fact against
-real code (`GoofspielModel`, `TeacherRouter`, `_immediate_target`,
-`robust_policy_fn`, `run_stage7_redteam`) — none reads a stored field.
+S7-F1 applied the minimal fix: stages.py now packs the teacher policy by card VALUE
+(`teacher_policy[b, card-1] = prob` over `zip(state.self_actions, row)`), so the KL
+target agrees with the head, the legality mask, and the Q target. These tests now
+assert the *corrected* contract and act as the permanent regression guard; the
+former `xfail(strict)` production tripwire is now a plain PASS.
 
-Test map (S7-D1 §44):
-  * Gate D1 / A / C / G  — `test_zero_step_correction_is_identity`
-  * Test D (teacher frozen) — `test_teacher_target_is_a_frozen_constant`
-  * Test E (target legality) — `test_gapped_1_3_packs_onto_illegal_slot` [PINS-BUG]
-  * Test F (index round-trip) — `test_gapped_2_3_packs_onto_wrong_legal_card`,
-                                `test_contiguous_mask_round_trips` [PINS-BUG]
-  * Isolation + fix demo — `test_correction_contrast_positional_vs_value`
-  * Production tripwire — `test_endtoend_contiguous_only_train_corrects_cleanly` (stable),
-                          `test_endtoend_gapped_train_blows_up_teacher_nll` (xfail strict)
+Evidence grade (S7-D1 sec.43): every assertion below RE-EXECUTES the fact against
+real code (`GoofspielModel`, `TeacherRouter`, `_immediate_target`, `robust_policy_fn`,
+`run_stage7_redteam`) -- none reads a stored field.
 
-MAINTENANCE CONTRACT: the tests tagged **[PINS-BUG]** assert the *current buggy*
-packing behavior; when the value-slot fix is applied (S7-D1 sec.'Proposed fix'),
-they MUST be flipped to assert the corrected contract, and the xfail(strict)
-tripwire will start XPASSING — remove its marker at that time. The corrected
-contract is already spelled out by the `by_value` branch of
-`test_correction_contrast_positional_vs_value`.
+Test map:
+  * Gate D1 (0-step identity, Class D excluded) -- test_zero_step_correction_is_identity
+  * Teacher frozen -- test_teacher_target_is_a_frozen_constant
+  * Corrected slotting (gapped) -- test_gapped_2_3_packs_onto_correct_card,
+                                   test_gapped_1_3_packs_onto_legal_teacher_card
+  * Contiguous control -- test_contiguous_mask_round_trips
+  * Isolation (why the fix works) -- test_correction_contrast_positional_vs_value,
+                                     test_correction_contrast_contiguous_is_packing_invariant
+  * Production tripwires -- test_endtoend_contiguous_only_train_corrects_cleanly (stable),
+                            test_endtoend_gapped_train_reduces_teacher_nll (was xfail-strict)
+
+`_pack_positional` below is retained ONLY as the verbatim replica of the OLD
+(pre-fix) code so the isolation contrast test can still demonstrate that positional
+packing fails where value-slot packing succeeds. `_pack_by_value` is the verbatim
+replica of the now-shipped production packing (stages.py). Exhaustive slot-contract
+property tests (all N=5 subsets, round-trip, N=13 gapped, target legality) live in
+test_stage7_teacher_policy_value_slot.py.
 """
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -67,7 +75,8 @@ def _teacher_row_and_card(state: GameState):
 
 
 def _pack_positional(states, rows):
-    """VERBATIM replica of stages.py:3138-3142 (production, under audit)."""
+    """VERBATIM replica of the OLD pre-fix packing (stages.py:3138-3142, the code
+    that produced rerun567). Retained ONLY for the isolation contrast test."""
     tp = torch.zeros(len(states), MAX_CARDS)
     for b, row in enumerate(rows):
         for i, v in enumerate(row[:MAX_CARDS]):
@@ -76,28 +85,31 @@ def _pack_positional(states, rows):
 
 
 def _pack_by_value(states, rows):
-    """Proposed minimal fix: slot = card value - 1 (matches robust_policy_logits
-    and the _immediate_target Q slotting)."""
+    """VERBATIM replica of the shipped S7-F1 production packing (stages.py): slot =
+    card value - 1, so the target matches robust_policy_logits, the legality mask,
+    and the _immediate_target Q slotting."""
     tp = torch.zeros(len(states), MAX_CARDS)
     for b, (state, row) in enumerate(zip(states, rows)):
-        for i, v in enumerate(row[: len(state.self_actions)]):
-            tp[b, state.self_actions[i] - 1] = float(v)
+        for card, prob in zip(state.self_actions, row):
+            tp[b, card - 1] = float(prob)
     return tp / tp.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 def _mass_slot_and_card(state: GameState) -> tuple[int, int]:
+    """Pack with the FIXED (value-slot) packer and report where the teacher's
+    dominant mass lands. robust_policy_fn decodes logits[card-1]: slot k <-> card k+1."""
     row, _ = _teacher_row_and_card(state)
-    tp = _pack_positional([state], [row])[0]
+    tp = _pack_by_value([state], [row])[0]
     slot = int(torch.argmax(tp).item())
-    return slot, slot + 1  # robust_policy_fn decodes logits[card-1] ⇒ slot k ⟷ card k+1
+    return slot, slot + 1
 
 
 # =============================================================================
-# Test F — indexing round-trip
+# Index round-trip (contiguous control)
 # =============================================================================
 def test_contiguous_mask_round_trips():
-    """Contiguous-from-1 mask: positional packing == value slotting, so the
-    teacher card round-trips and SMOKE never sees the bug."""
+    """Contiguous-from-1 mask: positional packing == value slotting, so the teacher
+    card round-trips under both packers and SMOKE never saw the bug."""
     row, tcard = _teacher_row_and_card(CONTIGUOUS_123)
     assert CONTIGUOUS_123.self_actions == [1, 2, 3]
     slot, decoded = _mass_slot_and_card(CONTIGUOUS_123)
@@ -105,46 +117,51 @@ def test_contiguous_mask_round_trips():
     assert decoded in CONTIGUOUS_123.self_actions
 
 
-def test_gapped_2_3_packs_onto_wrong_legal_card():  # [PINS-BUG]
-    """GAPPED {2,3}: the round-trip FAILS silently — mass lands on a *legal* but
-    WRONG card, so the loss looks normal while the wrong action is trained."""
+# =============================================================================
+# Corrected slotting on gapped masks (these two were [PINS-BUG]; FIX LANDED)
+# =============================================================================
+def test_gapped_2_3_packs_onto_correct_card():
+    """GAPPED {2,3}: after the value-slot fix the teacher's card-3 mass lands on slot
+    2 = card VALUE 3 (the correct, legal card). The old silent wrong-card mode
+    (mass -> slot1 = card2) is gone."""
     row, tcard = _teacher_row_and_card(GAPPED_23)
     assert tcard == 3  # teacher wants card 3
     slot, decoded = _mass_slot_and_card(GAPPED_23)
-    assert decoded == 2, "positional packing routes card-3 mass to slot1=card2"
-    assert decoded in GAPPED_23.self_actions, "card 2 IS legal here (silent mode)"
-    assert decoded != tcard, "…but it is the WRONG card — round-trip is broken"
+    assert decoded == 3, "value-slot packing routes card-3 mass to slot2 = card3"
+    assert decoded == tcard, "round-trip holds: decoded card == teacher card"
+    assert decoded in GAPPED_23.self_actions, "card 3 is legal in {2,3}"
 
 
-# =============================================================================
-# Test E — target legality (teacher mass on an illegal, hard-masked slot)
-# =============================================================================
-def test_gapped_1_3_packs_onto_illegal_slot():  # [PINS-BUG]
-    """GAPPED {1,3}: the teacher's card-3 mass is packed onto slot1 = card VALUE
-    2, which is ILLEGAL. The model hard-masks that logit to -1e9, so the static
-    KL target is unsatisfiable and pi_loss is ~1e9."""
+def test_gapped_1_3_packs_onto_legal_teacher_card():
+    """GAPPED {1,3}: after the fix the teacher's card-3 mass lands on slot 2 = card
+    VALUE 3, which is LEGAL. The previously-hit slot1 (= card value 2, ILLEGAL) now
+    carries ZERO target mass, so the KL is a finite, small quantity -- not ~1e9."""
     row, tcard = _teacher_row_and_card(GAPPED_13)
     assert tcard == 3
     slot, decoded = _mass_slot_and_card(GAPPED_13)
-    assert decoded == 2
-    assert decoded not in GAPPED_13.self_actions, "card 2 is ILLEGAL in {1,3}"
+    assert decoded == 3 and decoded in GAPPED_13.self_actions
+
+    tp = _pack_by_value([GAPPED_13], [row])
+    illegal_slot = 1  # card value 2 is illegal in {1,3}
+    assert float(tp[0, illegal_slot]) == 0.0, "no target mass on the illegal slot"
 
     model = GoofspielModel(max_cards=MAX_CARDS).eval()
     with torch.no_grad():
         logits = model(public_state_from_game([GAPPED_13], max_cards=MAX_CARDS)).robust_policy_logits[0]
-    assert logits[slot].item() <= -1e8, "illegal slot must be hard-masked (~-1e9)"
-    tp = _pack_positional([GAPPED_13], [row])
+    assert logits[illegal_slot].item() <= -1e8, "illegal slot is still hard-masked (~-1e9)"
     pi_loss = F.kl_div(F.log_softmax(logits.unsqueeze(0), dim=-1), tp, reduction="batchmean")
-    assert float(pi_loss) > 1e8, "target on a masked slot yields a ~1e9 KL"
+    assert math.isfinite(float(pi_loss)) and float(pi_loss) < 50.0, (
+        "target on legal slots yields a finite, small KL (no 1e9 blowup)"
+    )
 
 
 # =============================================================================
-# Isolation + fix demonstration — run the REAL loss both ways
+# Isolation + fix demonstration -- run the REAL correction loop both ways
 # =============================================================================
 def _run_correction(state: GameState, packer, *, steps: int = 20, lr: float = 1e-3, seed: int = 0):
-    """VERBATIM replica of the correction loop stages.py:3143-3157 on one state,
-    swapping only the teacher-policy packer. Returns (argmax_card_after,
-    p_teacher_card_after)."""
+    """VERBATIM replica of the correction loop stages.py:3143-3157 (UNCHANGED by the
+    fix) on one state, swapping only the teacher-policy packer. Returns
+    (argmax_card_after, p_teacher_card_after)."""
     torch.manual_seed(seed)
     model = GoofspielModel(max_cards=MAX_CARDS)
     row, tcard = _teacher_row_and_card(state)
@@ -170,14 +187,14 @@ def _run_correction(state: GameState, packer, *, steps: int = 20, lr: float = 1e
 
 @pytest.mark.parametrize("state", [GAPPED_13, GAPPED_23], ids=["gapped_1_3", "gapped_2_3"])
 def test_correction_contrast_positional_vs_value(state):
-    """Identical hyperparameters, identical init, identical loss — only the
-    packing differs. Positional (production) FAILS to learn the teacher card on
-    gapped states; by-value (proposed fix) learns it. This isolates the cause to
-    the packing and EXCLUDES LR/steps/optimizer (D1-C) and eval (D1-D)."""
+    """Identical hyperparameters, identical init, identical loss -- only the packing
+    differs. Positional (old code) FAILS to learn the teacher card on gapped states;
+    by-value (the shipped fix) learns it. This isolates the cause to the packing and
+    EXCLUDES LR/steps/optimizer (D1-C) and eval (D1-D)."""
     _, tcard = _teacher_row_and_card(state)
 
     arg_pos, p_pos = _run_correction(state, _pack_positional)
-    assert arg_pos != tcard, "positional packing must NOT learn the teacher card (bug)"
+    assert arg_pos != tcard, "positional packing must NOT learn the teacher card (old bug)"
     assert p_pos < 0.05, "positional packing drives p(teacher_card) toward 0"
 
     arg_val, p_val = _run_correction(state, _pack_by_value)
@@ -186,8 +203,8 @@ def test_correction_contrast_positional_vs_value(state):
 
 
 def test_correction_contrast_contiguous_is_packing_invariant():
-    """Control: on a contiguous mask both packings are identical, so both learn
-    the teacher card. Confirms the defect is specific to gapped masks."""
+    """Control: on a contiguous mask both packings are identical, so both learn the
+    teacher card. Confirms the defect was specific to gapped masks."""
     _, tcard = _teacher_row_and_card(CONTIGUOUS_123)
     for packer in (_pack_positional, _pack_by_value):
         arg, p = _run_correction(CONTIGUOUS_123, packer)
@@ -195,24 +212,24 @@ def test_correction_contrast_contiguous_is_packing_invariant():
 
 
 # =============================================================================
-# Test D — the teacher target is a frozen constant (rules out teacher drift)
+# The teacher target is a frozen constant (rules out teacher drift)
 # =============================================================================
 def test_teacher_target_is_a_frozen_constant():
     row, _ = _teacher_row_and_card(GAPPED_13)
-    tp = _pack_positional([GAPPED_13], [row])
+    tp = _pack_by_value([GAPPED_13], [row])
     assert tp.requires_grad is False, "teacher target must be a constant leaf"
-    # The router/solver has no torch parameters — nothing to train into it.
+    # The router/solver has no torch parameters -- nothing to train into it.
     assert not hasattr(_ROUTER, "parameters"), "TeacherRouter is a solver, not a module"
 
 
 # =============================================================================
-# Gate D1 — 0-step identity control (rules out Class D: eval/report/pipeline bug)
+# Gate D1 -- 0-step identity control (rules out Class D: eval/report/pipeline bug)
 # =============================================================================
 def test_zero_step_correction_is_identity(tmp_path: Path):
-    """With correction_steps=0 the pipeline (generate → teacher → pack → save →
-    reload → eval) must be a no-op: before==after on every bucket AND the saved
-    'corrected' checkpoint is byte-identical to the init checkpoint. Proves eval
-    is non-mutating and any regression is caused by the correction STEPS."""
+    """With correction_steps=0 the pipeline (generate -> teacher -> pack -> save ->
+    reload -> eval) must be a no-op: before==after on every bucket AND the saved
+    'corrected' checkpoint is byte-identical to the init checkpoint. Proves eval is
+    non-mutating and any regression is caused by the correction STEPS."""
     from goofspiel.training.budgets import Stage7Budget
     from goofspiel.training.checkpoint import load_checkpoint
     from goofspiel.training.stages import run_stage7_redteam
@@ -238,9 +255,9 @@ def test_zero_step_correction_is_identity(tmp_path: Path):
 # Production tripwires (drive the REAL run_stage7_redteam onto real attack sets)
 # =============================================================================
 def test_endtoend_contiguous_only_train_corrects_cleanly(tmp_path: Path):
-    """seed=43, train_cases=2 → the train slice is contiguous legacy states only.
-    The real correction must reduce teacher-NLL and not regress match-rate.
-    Stable (invariant to the packing fix)."""
+    """seed=43, train_cases=2 -> the train slice is contiguous legacy states only.
+    The real correction must reduce teacher-NLL and not regress match-rate. Stable
+    (invariant to the packing fix)."""
     from goofspiel.training.budgets import Stage7Budget
     from goofspiel.training.stages import run_stage7_redteam
 
@@ -252,14 +269,12 @@ def test_endtoend_contiguous_only_train_corrects_cleanly(tmp_path: Path):
     assert reg["match_rate_after"] >= reg["match_rate_before"], "contiguous correction must not regress match-rate"
 
 
-@pytest.mark.xfail(strict=True, reason="S7-D1 CONFIRMED BUG: stages.py:3138-3142 packs the teacher "
-                   "policy positionally; on gapped train states this blows up teacher-NLL. Remove "
-                   "this marker when the value-slot fix lands (it will XPASS).")
-def test_endtoend_gapped_train_blows_up_teacher_nll(tmp_path: Path):
-    """seed=7, train_cases=6 → the train slice INCLUDES gapped states ({1,3},{2,3}).
-    CORRECT contract: a focused correction should not worsen teacher-NLL on the
-    very states it trained on. It currently does (≈0.85 → ≈6.9), so this xfails
-    until the packing is fixed."""
+def test_endtoend_gapped_train_reduces_teacher_nll(tmp_path: Path):
+    """seed=7, train_cases=6 -> the train slice INCLUDES gapped states ({1,3},{2,3}).
+    Under the OLD positional packing this blew teacher-NLL up (~0.85 -> ~6.9); with
+    the value-slot fix a focused correction must NOT worsen teacher-NLL on the very
+    states it trained on. This was xfail(strict) under the bug and is now a plain
+    PASS -- the permanent production tripwire for the fix."""
     from goofspiel.training.budgets import Stage7Budget
     from goofspiel.training.stages import run_stage7_redteam
 
@@ -267,4 +282,7 @@ def test_endtoend_gapped_train_blows_up_teacher_nll(tmp_path: Path):
                           heldout_attack_cases=0, arena_games=0, arena_seeds=0)
     run_stage7_redteam(out_dir=tmp_path / "s7", correction_steps=20, n_cards=13, seed=7, budget=budget)
     reg = json.loads((tmp_path / "s7" / "redteam" / "focused_correction_report.json").read_text(encoding="utf-8"))["regression"]
-    assert reg["mean_teacher_nll_after"] <= reg["mean_teacher_nll_before"] + 0.5
+    assert reg["mean_teacher_nll_after"] <= reg["mean_teacher_nll_before"] + 0.5, (
+        f"gapped correction must not blow up teacher-NLL: "
+        f"before={reg['mean_teacher_nll_before']:.3f} after={reg['mean_teacher_nll_after']:.3f}"
+    )

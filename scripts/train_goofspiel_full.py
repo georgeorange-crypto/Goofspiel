@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from goofspiel.training import TrainingCoordinator, TrainingRunConfig
+from goofspiel.training.budgets import OVERRIDE_KEYS, PROFILES, resolve_budgets
 
 
 def _run_eval_checkpoint(args: argparse.Namespace) -> None:
@@ -93,10 +94,84 @@ def parse_args() -> argparse.Namespace:
                    help="Card counts to evaluate the checkpoint at (default: 5 7).")
     p.add_argument("--eval-games", type=int, default=64,
                    help="Games per matchup during checkpoint evaluation.")
+    # -----------------------------------------------------------------------
+    # Stage6/7/eval budget & evaluation-profile surface (Step 1 upgrade).
+    # --profile selects a preset (SMOKE=default/CI, QUICK=diagnostic, FULL=
+    # statistical); the per-stage flags below OVERRIDE individual preset fields.
+    # All per-stage flags default to None so an unset flag inherits the profile
+    # preset (and, for stage4_steps/stage5_sessions only, the --steps fallback).
+    # Leaving everything unset resolves to SMOKE → today's CI behaviour exactly.
+    # -----------------------------------------------------------------------
+    p.add_argument("--profile", choices=list(PROFILES), default=None,
+                   help="Budget/evaluation profile preset (default: SMOKE). "
+                        "Only FULL emits a binding PASS/FAIL; QUICK/SMOKE report "
+                        "NOT_EVALUATED.")
+    p.add_argument("--budget-config", default=None,
+                   help="Optional path to a budget YAML/JSON overriding the "
+                        "profile preset (precedence: explicit flag > this file > "
+                        "profile > --steps fallback > default).")
+    # θ-training budgets (historically consumed the global --steps).
+    p.add_argument("--stage4-steps", type=int, default=None)
+    p.add_argument("--stage5-sessions", type=int, default=None)
+    p.add_argument("--stage5-adaptation-steps", type=int, default=None)
+    # Stage6 league statistical workload.
+    p.add_argument("--stage6-games-per-matchup", type=int, default=None)
+    p.add_argument("--stage6-seeds", type=int, default=None)
+    p.add_argument("--stage6-prize-sequences", type=int, default=None)
+    # Stage7 red-team discovery / correction / regression workload.
+    p.add_argument("--stage7-attack-cases", type=int, default=None)
+    p.add_argument("--stage7-correction-steps", type=int, default=None)
+    p.add_argument("--stage7-heldout-attack-cases", type=int, default=None)
+    p.add_argument("--stage7-correction-train-cases", type=int, default=None)
+    p.add_argument("--stage7-arena-games", type=int, default=None)
+    p.add_argument("--stage7-arena-seeds", type=int, default=None)
+    # Evaluation-suite workload.
+    p.add_argument("--eval-games-per-matchup", type=int, default=None)
+    p.add_argument("--eval-seeds", type=int, default=None)
     return p.parse_args()
 
 
+def _load_budget_config(path: str) -> dict:
+    """Load a flat budget-override mapping from a JSON or YAML file.
+
+    Only keys in ``OVERRIDE_KEYS`` are honored; anything else is ignored.  This
+    is the thin file-adapter tier: values here override the profile preset but
+    are themselves overridden by explicit CLI flags (see ``config_from_args``).
+    A top-level ``overrides:`` wrapper is tolerated.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    if Path(path).suffix.lower() in (".yaml", ".yml"):
+        try:
+            import yaml  # type: ignore
+        except ImportError as exc:  # pragma: no cover - env-dependent
+            raise SystemExit(
+                f"--budget-config {path!r} is YAML but PyYAML is not installed; "
+                "install pyyaml or pass a .json budget file."
+            ) from exc
+        data = yaml.safe_load(text) or {}
+    else:
+        data = json.loads(text or "{}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"--budget-config {path!r} must contain a mapping.")
+    if isinstance(data.get("overrides"), dict):
+        data = data["overrides"]
+    return {k: data[k] for k in OVERRIDE_KEYS if data.get(k) is not None}
+
+
 def config_from_args(args: argparse.Namespace) -> TrainingRunConfig:
+    # Per-stage overrides from the CLI (None = "flag not passed" → inherit preset).
+    overrides = {k: getattr(args, k, None) for k in OVERRIDE_KEYS}
+    # --budget-config is a precedence tier BELOW explicit flags but ABOVE the
+    # profile preset: fill only the keys the user did not pass on the CLI.
+    if args.budget_config is not None:
+        for key, value in _load_budget_config(args.budget_config).items():
+            if overrides.get(key) is None:
+                overrides[key] = value
+    budgets = resolve_budgets(
+        profile=args.profile,
+        steps_fallback=args.steps,
+        overrides=overrides,
+    )
     return TrainingRunConfig(
         artifact_dir=args.artifact_dir,
         seed=args.seed,
@@ -113,6 +188,7 @@ def config_from_args(args: argparse.Namespace) -> TrainingRunConfig:
             "stage4_resume_checkpoint_interval": args.stage4_resume_checkpoint_interval,
             "stage5_heartbeat_timeout": args.stage5_heartbeat_timeout,
             "stage5_hard_timeout": args.stage5_hard_timeout,
+            "budgets": asdict(budgets),
         },
     )
 

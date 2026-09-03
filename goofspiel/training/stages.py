@@ -7,6 +7,7 @@ import itertools
 import json
 import random
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,7 @@ from goofspiel.training.stage_control import (
 from goofspiel.training.state_coverage import coverage_report, sample_reachable_states
 from goofspiel.training.pretraining import build_pretraining_targets
 from goofspiel.training.adaptive import default_opponent_curriculum, opponent_action_for_regime, oracle_opponent_diagnostic
+from goofspiel.training.budgets import Stage6Budget, Stage7Budget
 from goofspiel.training.teachers import TeacherRouter
 
 
@@ -2175,12 +2177,32 @@ class _CheckpointPolicy:
         self.checkpoint_path = str(checkpoint_path)
         self.model, self.metadata = load_model_from_checkpoint(checkpoint_path, device=device)
         self._fn = robust_policy_fn(self.model, device=device, greedy=False, temperature=temperature)
+        # A ``PolicyFn`` (state -> {card: prob}) view for ``play_policy_vs_bot``;
+        # ``policy_for_state`` below is the 13-slot list view ``_play_policy_match``
+        # speaks.  One loaded model, two interface shapes.
+        self.policy_fn = self._fn
 
     def policy_for_state(self, state: GameState) -> list[float]:
         dist = self._fn(state)
         policy = [0.0] * 13
         for card, prob in dist.items():
             policy[card - 1] = float(prob)
+        return policy
+
+
+class _AggressorPolicy:
+    """A fixed, deterministic red-team adversary: always bids the highest legal
+    card.  This is the honest 'aggressive pressure' archetype used as the
+    red-team opponent slot in the Stage7 arena — a real fixed strategy, never a
+    fabricated search result.  ``policy_for_state`` concentrates all mass on the
+    top legal card so it plugs straight into ``_play_policy_match_seq``.
+    """
+
+    def policy_for_state(self, state: GameState) -> list[float]:
+        policy = [0.0] * 13
+        legal = state.self_actions
+        if legal:
+            policy[max(legal) - 1] = 1.0
         return policy
 
 
@@ -2207,17 +2229,203 @@ def _mint_league_snapshot(role: str, *, out_dir: Path, seed: int, n_cards: int =
     return metrics.checkpoint
 
 
-def _play_policy_match(row_policy: Any, col_policy: Any, *, n_cards: int, seed: int) -> float:
+def _play_policy_match_seq(
+    row_policy: Any,
+    col_policy: Any,
+    *,
+    n_cards: int,
+    prize_order: list[int],
+    seed: int,
+) -> float:
+    """Play one row-vs-col game on a caller-supplied prize schedule.
+
+    ``prize_order`` is the full ordered reveal of prizes ``1..n`` (a permutation).
+    The opening prize is ``prize_order[0]`` and each subsequent reveal is the next
+    element, so the legacy ascending schedule is ``prize_order=[1,2,…,n]`` — which
+    is exactly what ``GameState.initial(n, current_prize=1)`` + the lowest-remaining
+    ``_choose_next_prize`` default produces.  This makes ``_play_policy_match``
+    (below) a byte-exact special case and lets Stage6 vary the prize schedule
+    (and reuse it across both seat orders for common random numbers) without a
+    second game loop.
+    """
+    if not prize_order:
+        prize_order = list(range(1, n_cards + 1))
     rng = random.Random(seed)
-    state = GameState.initial(n_cards, current_prize=1)
+    state = GameState.initial(n_cards, current_prize=int(prize_order[0]))
+    reveal_index = 1
     while not state.done:
         row_dist = row_policy.policy_for_state(state)
         col_dist = col_policy.policy_for_state(_mirrored_state(state))
         row_action = _sample_from_policy(row_dist, state.self_actions, rng)
         col_action = _sample_from_policy(col_dist, state.opponent_actions, rng)
-        next_prize = legal_cards(state.prize_mask, state.n)[0] if state.prize_mask else None
+        if state.prize_mask:
+            next_prize = int(prize_order[reveal_index]) if reveal_index < len(prize_order) else None
+            if next_prize is None or not (state.prize_mask & (1 << (next_prize - 1))):
+                # The schedule ran out or named an already-revealed prize; fall
+                # back to the deterministic lowest-remaining reveal so the game
+                # always terminates on a legal prize.
+                next_prize = legal_cards(state.prize_mask, state.n)[0]
+            reveal_index += 1
+        else:
+            next_prize = None
         state = transition(state, row_action, col_action, next_prize=next_prize).state
     return float(state.self_score - state.opp_score)
+
+
+def _play_policy_match(row_policy: Any, col_policy: Any, *, n_cards: int, seed: int) -> float:
+    # Legacy ascending prize schedule [1,2,…,n]; kept as the byte-exact special
+    # case a re-execution test reproduces.
+    return _play_policy_match_seq(
+        row_policy,
+        col_policy,
+        n_cards=n_cards,
+        prize_order=list(range(1, n_cards + 1)),
+        seed=seed,
+    )
+
+
+def _prize_sequences(n_cards: int, seed: int, k: int) -> list[list[int]]:
+    """Deterministic pool of ``k`` prize reveal orders for ``n_cards``.
+
+    Sequence 0 is ALWAYS the legacy ascending ``[1,2,…,n]`` so SMOKE (k=1) is
+    byte-identical to today.  Sequences 1..k-1 are seed-deterministic permutations
+    from independent ``random.Random`` streams, so common random numbers can be
+    shared across seat orders while still exercising varied prize schedules.
+    """
+    base = list(range(1, n_cards + 1))
+    sequences = [list(base)]
+    for q in range(1, max(1, int(k))):
+        perm = random.Random(int(seed) * 7919 + q).sample(base, n_cards)
+        sequences.append(perm)
+    return sequences[: max(1, int(k))]
+
+
+def _bootstrap_ci(
+    values: list[float],
+    *,
+    seed: int,
+    iters: int = 2000,
+    alpha: float = 0.05,
+) -> tuple[float, float]:
+    """Deterministic pure-python bootstrap CI for the mean of ``values``.
+
+    Collapses to ``(v, v)`` for a single value (SMOKE), so a 1/1/1 matchup has a
+    degenerate but well-defined interval.  Given the same ``values`` and ``seed``
+    the result is reproducible (a re-execution test recomputes it), because the
+    resampling draws from a single seeded ``random.Random``.
+    """
+    if not values:
+        return (0.0, 0.0)
+    if len(values) == 1:
+        v = float(values[0])
+        return (v, v)
+    rng = random.Random(seed)
+    n = len(values)
+    means: list[float] = []
+    for _ in range(max(1, int(iters))):
+        resample = [values[rng.randrange(n)] for _ in range(n)]
+        means.append(sum(resample) / n)
+    means.sort()
+    lo_idx = max(0, int((alpha / 2.0) * len(means)))
+    hi_idx = min(len(means) - 1, int((1.0 - alpha / 2.0) * len(means)))
+    return (float(means[lo_idx]), float(means[hi_idx]))
+
+
+@dataclass(frozen=True)
+class AttackCase:
+    """One discovered adversarial state plus the family it belongs to.
+
+    ``family`` groups attacks so the held-out split can measure BOTH
+    same-family generalization (states like the trained ones) and
+    other-family generalization (structurally different states).  ``case_index``
+    is the 0-based position within the generation order and drives the legacy
+    ``redteam_attack_{idx}`` id scheme.
+    """
+
+    state: GameState
+    family: str
+    case_index: int
+
+
+def _generate_attacks(
+    *,
+    n_cards: int,
+    seed: int,
+    count: int,
+    families: tuple[str, ...] = ("carry_and_asymmetric_masks", "curriculum_regimes"),
+    include_legacy_prefix: bool = True,
+) -> list[AttackCase]:
+    """Seed-deterministic adversarial-state generator.
+
+    The FIRST family, ``carry_and_asymmetric_masks``, has as its canonical
+    family-0 cases (indices 0,1,2) the exact three legacy attack states, in
+    order.  So ``count=3`` returns precisely those three states, in the legacy
+    order, preserving the SMOKE contract (``failures==3`` with ids
+    ``redteam_attack_{0,1,2}_seed{seed}_n{n}``).  Larger counts extend with more
+    carry/asymmetric-mask states and then states snapshotted from the opponent
+    curriculum regimes — everything drawn from a single seeded ``random.Random``
+    so ids are reproducible.
+
+    ``include_legacy_prefix=False`` skips the three legacy states entirely and
+    generates purely from the seeded RNG.  Held-out *other-family* probes use
+    this so they never re-emit the trained-on legacy states.
+    """
+    # The three legacy states, always first and always n=3 (they label under the
+    # caller's n_cards only via the id string, exactly as before).
+    legacy = [
+        GameState.initial(3, current_prize=1),
+        GameState.initial(3, current_prize=2),
+        GameState(n=3, self_mask=0b011, opp_mask=0b110, prize_mask=0b100, current_prize=1, carry_pool=2, round_index=2),
+    ]
+    cases: list[AttackCase] = []
+    if include_legacy_prefix:
+        for i, state in enumerate(legacy):
+            cases.append(AttackCase(state=state, family=families[0], case_index=i))
+            if len(cases) >= count:
+                return cases[:count]
+
+    rng = random.Random(int(seed))
+    # Extend family-0 (carry_and_asymmetric_masks) with more small asymmetric
+    # states: random legal self/opp masks over n=3 with a random carry pool.
+    while len(cases) < count and families:
+        # Alternate between the two families as we grow, but keep family-0 states
+        # generated first so a moderate count stays within the primary family.
+        family = families[0] if (len(cases) % 2 == 1 or len(families) == 1) else families[-1]
+        if family == "curriculum_regimes":
+            regimes = default_opponent_curriculum()
+            regime = regimes[rng.randrange(len(regimes))]
+            nn = 3
+            legal = list(range(1, nn + 1))
+            stake = rng.randint(1, nn)
+            opp_card = opponent_action_for_regime(regime.regime_id, legal, stake=stake, n_cards=nn, rng=rng)
+            self_card = rng.choice(legal)
+            self_mask = ((1 << nn) - 1) & ~(1 << (self_card - 1))
+            opp_mask = ((1 << nn) - 1) & ~(1 << (opp_card - 1))
+            prize_mask = (1 << nn) - 1
+            # Reveal a random prize; keep it legal.
+            prize = rng.choice(legal)
+            prize_mask &= ~(1 << (prize - 1))
+            state = GameState(
+                n=nn, self_mask=self_mask or 1, opp_mask=opp_mask or 1,
+                prize_mask=prize_mask, current_prize=prize, carry_pool=rng.randint(0, 2), round_index=2,
+            )
+        else:
+            nn = 3
+            full = (1 << nn) - 1
+            drop_self = rng.randint(0, nn)
+            drop_opp = rng.randint(0, nn)
+            self_mask = full & ~(1 << (drop_self - 1)) if drop_self else full
+            opp_mask = full & ~(1 << (drop_opp - 1)) if drop_opp else full
+            prize = rng.randint(1, nn)
+            prize_mask = full & ~(1 << (prize - 1))
+            state = GameState(
+                n=nn, self_mask=self_mask or 1, opp_mask=opp_mask or 1,
+                prize_mask=prize_mask, current_prize=prize,
+                carry_pool=rng.randint(0, 2), round_index=rng.randint(1, 2),
+            )
+        cases.append(AttackCase(state=state, family=family, case_index=len(cases)))
+    return cases[:count]
+
 
 
 def run_stage6_league(
@@ -2226,6 +2434,8 @@ def run_stage6_league(
     role_checkpoints: dict[str, str | Path] | None = None,
     n_cards: int = 3,
     seed: int = 1,
+    budget: Stage6Budget | None = None,
+    profile_name: str = "SMOKE",
 ) -> StageMetrics:
     runtime = current_runtime()
     if runtime.is_distributed:
@@ -2236,6 +2446,14 @@ def run_stage6_league(
             raise RuntimeError("stage6 payload broadcast failed")
         barrier_if_distributed()
         return StageMetrics("P6_LEAGUE", 1, payload["metrics"], payload.get("checkpoint"))
+
+    # SMOKE default: 1 game / 1 seed / 1 prize sequence — byte-preserves the
+    # legacy single-game cross-play.  Heavier statistical work is opt-in via the
+    # profile/flag-resolved budget.
+    budget = budget or Stage6Budget()
+    games_per_matchup = max(1, int(budget.games_per_matchup))
+    seeds = max(1, int(budget.seeds))
+    prize_sequences_n = max(1, int(budget.prize_sequences))
 
     out = Path(out_dir)
     registry_path = out / "league" / "registry.json"
@@ -2273,6 +2491,12 @@ def run_stage6_league(
         ckpt = agent.checkpoint_path or resolved.get(agent.role)
         policies[agent.agent_id] = _CheckpointPolicy(ckpt, temperature=0.5)
 
+    crossplay_seed_base = int(seed) + 600
+    # ---- Legacy single-game cross-play (byte-preserved) ----------------------
+    # Each of the 9 ordered pairs contributes exactly one game on the ascending
+    # prize schedule at seed `crossplay_seed_base + index`, exactly as before.
+    # This block is profile-independent so the re-execution test reproduces
+    # rows[0] with `seed=crossplay_seed_base`.
     cross_play = []
     for row_agent in agents:
         for col_agent in agents:
@@ -2280,7 +2504,7 @@ def run_stage6_league(
                 policies[row_agent.agent_id],
                 policies[col_agent.agent_id],
                 n_cards=n_cards,
-                seed=int(seed) + len(cross_play) + 600,
+                seed=crossplay_seed_base + len(cross_play),
             )
             cross_play.append(
                 {
@@ -2295,6 +2519,161 @@ def run_stage6_league(
                     "source": "simulated_crossplay",
                 }
             )
+
+    # ---- Statistical matrix (block/paired bootstrap; deltas #2/#3/#4/#15) -----
+    # The directly-readable ROBUST/AGGRESSIVE/EXPLOITER pairwise matrix.  Each
+    # ordered cell is aggregated over games × prize_sequences × seeds on common
+    # random numbers: the prize schedule AND the per-game seeds are keyed on the
+    # CANONICAL (unordered) pair, so cell (A,B) and cell (B,A) are played on the
+    # SAME decks with the SAME move-sampling seeds — genuine CRN pairing, not two
+    # independent samples.
+    #
+    #   * Block = (seed, prize_sequence) (delta #2).  A block holds
+    #     ``games_per_matchup`` games; the bootstrap resamples WHOLE BLOCKS (never
+    #     individual games), so the interval respects the CRN correlation
+    #     structure.  Equal-size blocks make the block bootstrap of the mean
+    #     exactly a bootstrap over the per-block means.
+    #   * Paired seat-symmetrized statistic (delta #3): for a fixed
+    #     (seed, prize_sequence, game) the A-advantage is
+    #     ``mean(diff_A_vs_B, −diff_B_vs_A)`` — identical in construction to
+    #     ``arena/match.play_pairing``'s ``a_adv = [seat0_diff, −seat1_diff]``.
+    #   * Fixed budget: NO sequential CI stopping anywhere (delta #4).
+    def _median(xs: list[float]) -> float:
+        s = sorted(xs)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        return s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+    matrix = []
+    total_games = 0
+    total_rounds = 0
+    total_blocks = 0
+    # Per-ordered-cell raw game diffs, keyed by (row_idx, col_idx) then
+    # (seed, prize_sequence) -> [game diffs].  Reused (NO re-play) to build the
+    # paired unordered-pair statistic below.
+    cell_block_games: dict[tuple[int, int], dict[tuple[int, int], list[float]]] = {}
+    t0 = time.perf_counter()
+    n_agents = len(agents)
+    for ri, row_agent in enumerate(agents):
+        for ci, col_agent in enumerate(agents):
+            lo_idx, hi_idx = (ri, ci) if ri <= ci else (ci, ri)
+            pair_key = lo_idx * n_agents + hi_idx  # canonical (shared across seats)
+            sequences = _prize_sequences(n_cards, seed=crossplay_seed_base + pair_key, k=prize_sequences_n)
+            row_pol = policies[row_agent.agent_id]
+            col_pol = policies[col_agent.agent_id]
+            per_seed_means: list[float] = []
+            all_diffs: list[float] = []
+            block_means: list[float] = []
+            block_rows: list[dict[str, Any]] = []
+            block_games_by_key: dict[tuple[int, int], list[float]] = {}
+            for s in range(seeds):
+                seed_diffs: list[float] = []
+                for q in range(prize_sequences_n):
+                    block_diffs: list[float] = []
+                    for g in range(games_per_matchup):
+                        # CRN: cell seed depends on the CANONICAL pair + (s,q,g),
+                        # NOT on seat order, so A-vs-B and B-vs-A share randomness.
+                        cell_seed = crossplay_seed_base + pair_key * 100000 + s * 1000 + q * 100 + g
+                        diff = _play_policy_match_seq(
+                            row_pol, col_pol, n_cards=n_cards, prize_order=sequences[q], seed=cell_seed
+                        )
+                        block_diffs.append(diff)
+                        seed_diffs.append(diff)
+                        all_diffs.append(diff)
+                        total_games += 1
+                        total_rounds += n_cards
+                    block_mean = sum(block_diffs) / max(1, len(block_diffs))
+                    block_means.append(block_mean)
+                    block_rows.append(
+                        {"seed": s, "prize_sequence": q, "games": list(block_diffs), "block_mean": block_mean}
+                    )
+                    block_games_by_key[(s, q)] = block_diffs
+                    total_blocks += 1
+                per_seed_means.append(sum(seed_diffs) / max(1, len(seed_diffs)))
+            cell_block_games[(ri, ci)] = block_games_by_key
+            n_games = max(1, len(all_diffs))
+            mean = sum(all_diffs) / n_games
+            var = sum((d - mean) ** 2 for d in all_diffs) / n_games
+            wins = sum(1 for d in all_diffs if d > 0)
+            draws = sum(1 for d in all_diffs if d == 0)
+            # delta #2: bootstrap resamples WHOLE (seed, prize_sequence) blocks.
+            # Seeded on the canonical pair key so a re-execution test reproduces it.
+            ci_low, ci_high = _bootstrap_ci(block_means, seed=crossplay_seed_base + pair_key)
+            matrix.append(
+                {
+                    "row_agent": row_agent.agent_id,
+                    "col_agent": col_agent.agent_id,
+                    "row_role": row_agent.role,
+                    "col_role": col_agent.role,
+                    # delta #3: diagonal is self-play, off-diagonal is competitive.
+                    "self_play": ri == ci,
+                    "relationship": "self_play" if ri == ci else "competitive",
+                    "games": len(all_diffs),
+                    "raw_games": len(all_diffs),           # delta #15
+                    "bootstrap_blocks": len(block_means),  # delta #15
+                    "blocks": len(block_means),            # delta #15 (per-ordered-pair)
+                    "seeds": seeds,
+                    "seeds_used": len(per_seed_means),
+                    "prize_sequences": prize_sequences_n,
+                    "win_rate": wins / n_games,
+                    "draw_rate": draws / n_games,
+                    "mean_score_diff": mean,
+                    "std": var ** 0.5,
+                    "median": _median(all_diffs),
+                    "worst_seed": min(per_seed_means) if per_seed_means else mean,       # delta #15
+                    "worst_seed_mean": min(per_seed_means) if per_seed_means else mean,  # legacy alias
+                    "ci_low": ci_low,
+                    "ci_high": ci_high,
+                    "ci_halfwidth": (ci_high - ci_low) / 2.0,
+                    "block_bootstrap_ci_low": ci_low,   # delta #15 canonical names
+                    "block_bootstrap_ci_high": ci_high,
+                    "block_rows": block_rows,
+                }
+            )
+
+    # ---- Paired seat-symmetrized statistic, per unordered competitive pair ----
+    # For each unordered pair (lo < hi), pair the ALREADY-PLAYED ordered cells
+    # (lo,hi) and (hi,lo) game-for-game on their shared CRN (seed, prize_sequence,
+    # game) indices.  The paired A-advantage is mean(diff_A_vs_B, −diff_B_vs_A);
+    # blocks stay whole (delta #2) and the CI is seeded on the canonical pair key
+    # plus a fixed 900000 offset so it is distinct from the per-cell interval and
+    # a re-execution test can reproduce it from the stored block rows (delta #19).
+    paired_matrix = []
+    for lo in range(n_agents):
+        for hi in range(lo + 1, n_agents):
+            fwd = cell_block_games.get((lo, hi), {})
+            rev = cell_block_games.get((hi, lo), {})
+            paired_games: list[float] = []
+            paired_block_means: list[float] = []
+            for key in sorted(set(fwd) & set(rev)):
+                fg, rg = fwd[key], rev[key]
+                block_pairs = [0.5 * (fg[g] - rg[g]) for g in range(min(len(fg), len(rg)))]
+                paired_games.extend(block_pairs)
+                if block_pairs:
+                    paired_block_means.append(sum(block_pairs) / len(block_pairs))
+            pair_key = lo * n_agents + hi
+            if paired_games:
+                p_mean = sum(paired_games) / len(paired_games)
+                p_lo, p_hi = _bootstrap_ci(paired_block_means, seed=crossplay_seed_base + pair_key + 900000)
+            else:
+                p_mean = p_lo = p_hi = 0.0
+            paired_matrix.append(
+                {
+                    "agent_a": agents[lo].agent_id,
+                    "agent_b": agents[hi].agent_id,
+                    "role_a": agents[lo].role,
+                    "role_b": agents[hi].role,
+                    "relationship": "competitive",
+                    "raw_games": len(paired_games),
+                    "paired_blocks": len(paired_block_means),
+                    "paired_mean_score_diff": p_mean,
+                    "paired_median": _median(paired_games),
+                    "paired_block_bootstrap_ci_low": p_lo,
+                    "paired_block_bootstrap_ci_high": p_hi,
+                }
+            )
+    wall_clock_s = time.perf_counter() - t0
 
     # Handcrafted algorithms are kept only as clearly-LABELLED reference
     # opponents, never conflated with the trained cross-play above.
@@ -2337,15 +2716,42 @@ def run_stage6_league(
         )
         for agent in agents
     }
+    ordered_matchups = len(matrix)
+    self_play_matchups = sum(1 for row in matrix if row["self_play"])
+    competitive_matchups = ordered_matchups - self_play_matchups
+    workload = {
+        # delta #15 run-level accounting.
+        "profile": str(profile_name or "SMOKE"),
+        "ordered_matchups": ordered_matchups,
+        "self_play_matchups": self_play_matchups,
+        "competitive_matchups": competitive_matchups,
+        "matchups": len(cross_play),  # legacy alias (9 ordered pairs)
+        "games_per_matchup": games_per_matchup,
+        "seeds": seeds,
+        "prize_sequences": prize_sequences_n,
+        "raw_games": total_games,
+        "bootstrap_blocks": total_blocks,
+        "sequential_ci_stop": False,  # delta #4: fixed budget on every profile
+        "ci_target_halfwidth": 0.0,
+        "total_games": total_games,
+        "total_episodes": total_games,
+        "total_actions": total_rounds * 2,
+        "total_rounds": total_rounds,
+        "wall_clock_s": wall_clock_s,
+        "games_per_sec": (total_games / wall_clock_s) if wall_clock_s > 0 else 0.0,
+    }
     league_report = {
         "counts_by_role": counts,
         "pfsp_weights": pfsp_weights,
         "cross_play": cross_play,
+        "matrix": matrix,
+        "paired_matrix": paired_matrix,
+        "workload": workload,
         "reference_play": reference_play,
         "agent_checkpoints": {agent.agent_id: policies[agent.agent_id].checkpoint_path for agent in agents},
         "historical_agents_frozen": all(agent.frozen for agent in agents),
         "seed": int(seed),
-        "crossplay_seed_base": int(seed) + 600,
+        "crossplay_seed_base": crossplay_seed_base,
         "reference_seed_base": int(seed) + 900,
     }
     report_path = out / "league" / "league_report.json"
@@ -2360,6 +2766,21 @@ def run_stage6_league(
             "reference_matches": float(len(reference_play)),
             "stage6_rank_owner": 0.0,
             "stage6_write_once": 1.0,
+            # Workload accounting (additive, numeric).
+            "stage6_matchups": float(len(cross_play)),
+            "stage6_ordered_matchups": float(ordered_matchups),
+            "stage6_self_play_matchups": float(self_play_matchups),
+            "stage6_competitive_matchups": float(competitive_matchups),
+            "stage6_games_per_matchup": float(games_per_matchup),
+            "stage6_seeds": float(seeds),
+            "stage6_prize_sequences": float(prize_sequences_n),
+            "stage6_raw_games": float(total_games),
+            "stage6_bootstrap_blocks": float(total_blocks),
+            "stage6_total_games": float(total_games),
+            "stage6_total_episodes": float(total_games),
+            "stage6_total_actions": float(total_rounds * 2),
+            "stage6_wall_clock_s": float(wall_clock_s),
+            "stage6_games_per_sec": float(workload["games_per_sec"]),
         }
     )
     payload = {"metrics": metrics, "checkpoint": None}
@@ -2368,6 +2789,32 @@ def run_stage6_league(
         raise RuntimeError("stage6 payload broadcast failed")
     barrier_if_distributed()
     return StageMetrics("P6_LEAGUE", 1, payload["metrics"], payload.get("checkpoint"))
+
+
+def _memorization_flag(
+    train_before: dict[str, Any],
+    train_after: dict[str, Any],
+    heldout_pairs: list[tuple[dict[str, Any] | None, dict[str, Any] | None]],
+) -> bool:
+    """Detect a memorizing correction: TRAIN match-rate improved but NO held-out
+    bucket did.
+
+    Pure and deterministic in its inputs (each bucket is an
+    ``_attack_state_regression`` result dict, or ``None`` when that bucket has no
+    states), so a test can both exercise the semantics on synthesized buckets AND
+    re-execute it on the reloaded before/after checkpoints and reproduce the exact
+    flag the runner reported.  A bucket that has no states (``None``) never counts
+    as an improvement; ``has_heldout`` is true iff at least one held-out bucket
+    exists.
+    """
+
+    def improved(before: dict[str, Any] | None, after: dict[str, Any] | None) -> bool:
+        return bool(before is not None and after is not None and after["match_rate"] > before["match_rate"])
+
+    train_improved = train_after["match_rate"] > train_before["match_rate"]
+    heldout_improved = any(improved(b, a) for b, a in heldout_pairs)
+    has_heldout = any(b is not None for b, _ in heldout_pairs)
+    return bool(train_improved and has_heldout and not heldout_improved)
 
 
 def _attack_state_regression(
@@ -2409,6 +2856,117 @@ def _attack_state_regression(
     }
 
 
+def _strong_bot_for(n_cards: int) -> tuple[str, str]:
+    """Return ``(requested, effective)`` for the arena's 'strong' opponent slot.
+
+    We request an exact-Nash bot (``nash`` for classic n≤NASH_MAX_N else the
+    carry variant), but the bot itself HONESTLY falls back to a heuristic above
+    its exact cap.  We mirror that cap here so the report records the truth
+    (e.g. n=13 → requested ``nash``, effective ``heuristic_fallback``) rather
+    than fabricating a search result.
+    """
+    from goofspiel.bots import NASH_MAX_N
+
+    requested = "nash"
+    effective = "nash" if int(n_cards) <= int(NASH_MAX_N) else "heuristic_fallback"
+    return requested, effective
+
+
+def _stage7_arena(
+    *,
+    robust_policy_fn_view,
+    corrected_policy_fn_view,
+    league_snapshot_policy,
+    redteam_policy,
+    n_cards: int,
+    arena_games: int,
+    arena_seeds: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Corrected-vs-robust arena across the honest bot suite (Section 7).
+
+    Plays BOTH the pre-correction robust policy and the post-correction policy
+    against Random / Heuristic / strong(nash→honest fallback) / League snapshot
+    / Red-team, over ``arena_games`` games × ``arena_seeds`` seeds.  Bots use
+    ``play_policy_vs_bot`` (real carry-over env); the League and Red-team slots
+    are model/fixed policies played through ``_play_policy_match_seq`` so the
+    whole arena is genuine play.  Returns per-opponent rows for both policies.
+    """
+    from goofspiel.training.model_eval import play_policy_vs_bot
+
+    games = max(1, int(arena_games))
+    seeds = max(1, int(arena_seeds))
+    requested, effective = _strong_bot_for(n_cards)
+    bot_slots = [
+        ("random", "random", "random"),
+        ("heuristic", "heuristic", "heuristic"),
+        ("strong", requested, effective),
+    ]
+
+    def _bot_row(policy_fn_view, slot, requested_name, effective_name) -> dict[str, Any]:
+        diffs: list[float] = []
+        wins = 0
+        for s in range(seeds):
+            res = play_policy_vs_bot(
+                policy_fn_view,
+                effective_name if effective_name != "heuristic_fallback" else "heuristic",
+                n_cards=n_cards,
+                num_games=games,
+                seed=int(seed) + s * 17 + 1,
+            )
+            diffs.append(res["mean_score_diff"])
+            wins += int(res["win_rate"] * games)
+        mean = sum(diffs) / max(1, len(diffs))
+        return {
+            "opponent_slot": slot,
+            "opponent_requested": requested_name,
+            "opponent_effective": effective_name,
+            "games": games * seeds,
+            "seeds": seeds,
+            "mean_score_diff": mean,
+            "win_rate": wins / max(1, games * seeds),
+        }
+
+    def _policy_match_row(policy_view, opponent_view, slot) -> dict[str, Any]:
+        diffs: list[float] = []
+        for s in range(seeds):
+            sequences = _prize_sequences(n_cards, seed=int(seed) + s * 31, k=1)
+            for g in range(games):
+                diffs.append(
+                    _play_policy_match_seq(
+                        policy_view, opponent_view, n_cards=n_cards,
+                        prize_order=sequences[0], seed=int(seed) + s * 1009 + g,
+                    )
+                )
+        mean = sum(diffs) / max(1, len(diffs))
+        return {
+            "opponent_slot": slot,
+            "opponent_requested": slot,
+            "opponent_effective": slot,
+            "games": games * seeds,
+            "seeds": seeds,
+            "mean_score_diff": mean,
+            "win_rate": sum(1 for d in diffs if d > 0) / max(1, len(diffs)),
+        }
+
+    def _rows_for(policy_fn_view, policy_match_view) -> list[dict[str, Any]]:
+        rows = [_bot_row(policy_fn_view, *slot) for slot in bot_slots]
+        if league_snapshot_policy is not None:
+            rows.append(_policy_match_row(policy_match_view, league_snapshot_policy, "league"))
+        rows.append(_policy_match_row(policy_match_view, redteam_policy, "redteam"))
+        return rows
+
+    return {
+        "n_cards": int(n_cards),
+        "arena_games": games,
+        "arena_seeds": seeds,
+        "strong_opponent_requested": requested,
+        "strong_opponent_effective": effective,
+        "robust": _rows_for(robust_policy_fn_view.policy_fn, robust_policy_fn_view),
+        "corrected": _rows_for(corrected_policy_fn_view.policy_fn, corrected_policy_fn_view),
+    }
+
+
 def run_stage7_redteam(
     *,
     out_dir: str | Path,
@@ -2417,6 +2975,8 @@ def run_stage7_redteam(
     lr: float = 1e-3,
     n_cards: int = 3,
     seed: int = 1,
+    budget: Stage7Budget | None = None,
+    profile_name: str = "SMOKE",
 ) -> StageMetrics:
     runtime = current_runtime()
     if runtime.is_distributed:
@@ -2436,22 +2996,39 @@ def run_stage7_redteam(
     failures = FailureBuffer(failures_path)
     corrections = CorrectionDataset(corrections_path)
     router = TeacherRouter()
-    attack_states = [
-        GameState.initial(3, current_prize=1),
-        GameState.initial(3, current_prize=2),
-        GameState(n=3, self_mask=0b011, opp_mask=0b110, prize_mask=0b100, current_prize=1, carry_pool=2, round_index=2),
-    ]
+
+    # SMOKE default: 3 discovered attacks (the legacy states), all in the train
+    # set, no held-out, no arena — byte-preserves today's behaviour.
+    budget = budget or Stage7Budget()
+    attack_cases = max(1, int(budget.attack_cases))
+    correction_train_cases = max(1, int(budget.correction_train_cases))
+    heldout_attack_cases = max(0, int(budget.heldout_attack_cases))
+    arena_games = max(0, int(budget.arena_games))
+    arena_seeds = max(0, int(budget.arena_seeds))
+
+    t0 = time.perf_counter()
+
+    # ---- Discovery -----------------------------------------------------------
+    # Seed-deterministic generation.  SMOKE (attack_cases=3) returns EXACTLY the
+    # three legacy states in order, preserving the ids and failures==3.
+    discovered = _generate_attacks(n_cards=n_cards, seed=int(seed), count=attack_cases)
+
+    router_cache: dict[int, Any] = {}
+
+    def _teacher_card(state: GameState) -> tuple[Any, int]:
+        sample = router.label_state(state)
+        pol = sample.teacher_policy or [1.0] * len(state.self_actions)
+        best_index = max(range(len(state.self_actions)), key=lambda i: pol[i])
+        return sample, state.self_actions[best_index]
+
     attack_report = []
     teacher_samples = []
     teacher_cards: list[int] = []
-    for idx, state in enumerate(attack_states):
-        sample = router.label_state(state)
+    for idx, case in enumerate(discovered):
+        state = case.state
+        sample, card = _teacher_card(state)
         teacher_samples.append(sample)
-        # The teacher's recommended action (argmax over legal cards), the target
-        # the focused correction trains toward and the regression re-checks.
-        pol = sample.teacher_policy or [1.0] * len(state.self_actions)
-        best_index = max(range(len(state.self_actions)), key=lambda i: pol[i])
-        teacher_cards.append(state.self_actions[best_index])
+        teacher_cards.append(card)
         failure = FailureRecord(
             failure_id=f"redteam_attack_{idx}_seed{int(seed)}_n{n_cards}",
             failure_type="ADVERSARIAL_STATE_REANALYSIS",
@@ -2460,7 +3037,7 @@ def run_stage7_redteam(
             teacher_source=sample.teacher_source,
             details={
                 "purpose": "minimal red-team correction loop",
-                "attack_family": "carry_and_asymmetric_masks",
+                "attack_family": case.family,
                 "teacher_confidence": sample.teacher_confidence,
             },
         )
@@ -2480,15 +3057,43 @@ def run_stage7_redteam(
             {
                 "failure_id": failure.failure_id,
                 "state_hash": failure.state.state_hash,
+                "attack_family": case.family,
                 "teacher_source": sample.teacher_source,
                 "teacher_confidence": sample.teacher_confidence,
-                "teacher_card": teacher_cards[idx],
+                "teacher_card": card,
             }
         )
 
+    # ---- Train / held-out split (kills the memorization hole) ----------------
+    # TRAIN = the first correction_train_cases discovered attacks; the focused
+    # correction optimises ONLY on these.  HELDOUT_SAME = the remaining discovered
+    # attacks (same family, never trained on).  HELDOUT_OTHER = freshly-generated
+    # structurally-different states (never the legacy ones).  A correction that
+    # generalises improves held-out too; one that memorizes improves only train.
+    train_slice = discovered[:correction_train_cases]
+    train_states = [c.state for c in train_slice]
+    train_cards = teacher_cards[:correction_train_cases]
+    train_samples = teacher_samples[:correction_train_cases]
+
+    heldout_same_states = [c.state for c in discovered[correction_train_cases:]]
+    heldout_same_cards = teacher_cards[correction_train_cases:]
+    if heldout_attack_cases > 0:
+        heldout_other_cases = _generate_attacks(
+            n_cards=n_cards,
+            seed=int(seed) * 3 + 1,
+            count=heldout_attack_cases,
+            families=("curriculum_regimes", "carry_and_asymmetric_masks"),
+            include_legacy_prefix=False,
+        )
+        heldout_other_states = [c.state for c in heldout_other_cases]
+        heldout_other_cards = [_teacher_card(st)[1] for st in heldout_other_states]
+    else:
+        heldout_other_states = []
+        heldout_other_cards = []
+
     # ---- Phase 4.4: a REAL focused fine-tune + MEASURED regression -----------
     # Load (or mint) a real checkpoint, measure the attack-state regression
-    # BEFORE, run a focused correction SFT on the teacher-relabeled attack states,
+    # BEFORE, run a focused correction SFT on the teacher-relabeled TRAIN states,
     # save the improved checkpoint, and measure the regression AFTER.  Every
     # pass/fail below is computed by re-playing the policy, never hardcoded.
     torch, F = _torch_import()
@@ -2504,14 +3109,34 @@ def run_stage7_redteam(
     model = GoofspielModel(max_cards=13)
     model.load_state_dict(load_checkpoint(init_from_checkpoint)["model_state"])
     model.eval()
-    regression_before = _attack_state_regression(model, attack_states, teacher_cards)
+    # BEFORE-correction regression on every bucket (same pre-correction model).
+    regression_before = _attack_state_regression(model, train_states, train_cards)
+    heldout_same_before = (
+        _attack_state_regression(model, heldout_same_states, heldout_same_cards)
+        if heldout_same_states else None
+    )
+    heldout_other_before = (
+        _attack_state_regression(model, heldout_other_states, heldout_other_cards)
+        if heldout_other_states else None
+    )
+    # Normal-play regression (opt-in with the arena budget): measured on the
+    # pre-correction model against the honest bot suite.
+    normal_before: dict[str, Any] | None = None
+    if arena_games > 0:
+        from goofspiel.training.model_eval import play_policy_vs_bot, robust_policy_fn
 
-    # Focused correction: KL toward the stored teacher policy on the attack states
+        pol_view = robust_policy_fn(model, greedy=False, temperature=1.0)
+        normal_before = {
+            bt: play_policy_vs_bot(pol_view, bt, n_cards=n_cards, num_games=arena_games, seed=int(seed) + 900)
+            for bt in ("random", "heuristic")
+        }
+
+    # Focused correction: KL toward the stored teacher policy on the TRAIN states
     # (+ an immediate-Q anchor), the exact states that failed.
-    batch = public_state_from_game(attack_states, max_cards=13)
-    target_q, q_mask = _immediate_target(attack_states, 13)
-    teacher_policy = torch.zeros(len(attack_states), 13)
-    for b, sample in enumerate(teacher_samples):
+    batch = public_state_from_game(train_states, max_cards=13)
+    target_q, q_mask = _immediate_target(train_states, 13)
+    teacher_policy = torch.zeros(len(train_states), 13)
+    for b, sample in enumerate(train_samples):
         for i, v in enumerate((sample.teacher_policy or [])[:13]):
             teacher_policy[b, i] = float(v)
     teacher_policy = teacher_policy / teacher_policy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -2530,7 +3155,16 @@ def run_stage7_redteam(
         opt.step()
         last_loss = float(loss.detach().cpu())
     model.eval()
-    regression_after = _attack_state_regression(model, attack_states, teacher_cards)
+    # AFTER-correction regression on every bucket (post-correction model).
+    regression_after = _attack_state_regression(model, train_states, train_cards)
+    heldout_same_after = (
+        _attack_state_regression(model, heldout_same_states, heldout_same_cards)
+        if heldout_same_states else None
+    )
+    heldout_other_after = (
+        _attack_state_regression(model, heldout_other_states, heldout_other_cards)
+        if heldout_other_states else None
+    )
 
     corrected_ckpt = out / "redteam" / "stage7_corrected.pt"
     save_checkpoint(
@@ -2551,13 +3185,66 @@ def run_stage7_redteam(
         ),
     )
 
+    # Normal-play regression AFTER, on the post-correction model.
+    normal_after: dict[str, Any] | None = None
+    if arena_games > 0:
+        from goofspiel.training.model_eval import play_policy_vs_bot, robust_policy_fn
+
+        pol_view = robust_policy_fn(model, greedy=False, temperature=1.0)
+        normal_after = {
+            bt: play_policy_vs_bot(pol_view, bt, n_cards=n_cards, num_games=arena_games, seed=int(seed) + 900)
+            for bt in ("random", "heuristic")
+        }
+
+    # ---- Arena (Section 7): corrected-vs-robust across the honest bot suite ---
+    arena: dict[str, Any] | None = None
+    if arena_games > 0:
+        robust_view = _CheckpointPolicy(init_from_checkpoint, temperature=1.0)
+        corrected_view = _CheckpointPolicy(corrected_ckpt, temperature=1.0)
+        league_ckpt = _mint_league_snapshot(
+            ROLE_EXPLOITER, out_dir=out / "redteam", seed=int(seed) + 303, n_cards=n_cards
+        )
+        league_view = _CheckpointPolicy(league_ckpt, temperature=0.5)
+        arena = _stage7_arena(
+            robust_policy_fn_view=robust_view,
+            corrected_policy_fn_view=corrected_view,
+            league_snapshot_policy=league_view,
+            redteam_policy=_AggressorPolicy(),
+            n_cards=n_cards,
+            arena_games=arena_games,
+            arena_seeds=arena_seeds,
+            seed=int(seed),
+        )
+
     # A red-team correction "recurs" (fails) if any attack the correction fixed
     # is still mis-played after training.  Passing = every attack matches the
     # teacher action after correction.  General regression is proxied by the
     # attack match-rate not collapsing below the before-correction rate.
     original_attack_regression_passed = bool(regression_after["passed"])
     general_regression_passed = bool(regression_after["match_rate"] >= regression_before["match_rate"])
-    recurrence = bool(regression_after["matched"] < len(attack_states))
+    recurrence = bool(regression_after["matched"] < len(train_states))
+
+    # Memorization detection: the correction improved TRAIN but NOT held-out.
+    # Delegated to the pure module-level helper so a test can re-execute the exact
+    # same decision on the reloaded before/after checkpoints (RE-EXECUTE the fact).
+    heldout_pairs = [
+        (heldout_same_before, heldout_same_after),
+        (heldout_other_before, heldout_other_after),
+    ]
+    memorization_flag = _memorization_flag(regression_before, regression_after, heldout_pairs)
+    regression_delta = float(regression_after["match_rate"] - regression_before["match_rate"])
+    wall_clock_s = time.perf_counter() - t0
+
+    def _bucket(before: dict | None, after: dict | None) -> dict[str, Any] | None:
+        if before is None or after is None:
+            return None
+        return {
+            "match_rate_before": before["match_rate"],
+            "match_rate_after": after["match_rate"],
+            "delta": after["match_rate"] - before["match_rate"],
+            "before": before,
+            "after": after,
+        }
 
     report_path = out / "redteam" / "redteam_report.json"
     focused_report = {
@@ -2571,7 +3258,7 @@ def run_stage7_redteam(
             "retain_general_replay_fraction": 0.25,
         },
         "regression": {
-            # MEASURED (Phase 4.4): computed by re-playing the attack states
+            # MEASURED (Phase 4.4): computed by re-playing the TRAIN attack states
             # before/after the focused correction, not fabricated.
             "original_attack_regression_passed": original_attack_regression_passed,
             "general_regression_passed": general_regression_passed,
@@ -2582,6 +3269,24 @@ def run_stage7_redteam(
             "mean_teacher_nll_after": regression_after["mean_teacher_nll"],
             "before": regression_before,
             "after": regression_after,
+        },
+        # ---- Held-out generalization + normal-play regression (additive) ------
+        "heldout_same_family": _bucket(heldout_same_before, heldout_same_after),
+        "heldout_other_family": _bucket(heldout_other_before, heldout_other_after),
+        "normal_play": {"before": normal_before, "after": normal_after} if normal_before is not None else None,
+        "memorization_flag": memorization_flag,
+        "regression_delta": regression_delta,
+        "arena": arena,
+        "workload": {
+            "profile": str(profile_name or "SMOKE"),
+            "attack_candidates_generated": len(discovered),
+            "correction_train_cases": len(train_states),
+            "heldout_same_tests": len(heldout_same_states),
+            "heldout_other_tests": len(heldout_other_states),
+            "correction_optimizer_steps": int(correction_steps),
+            "arena_games": arena_games,
+            "arena_seeds": arena_seeds,
+            "wall_clock_s": wall_clock_s,
         },
     }
     focused_path = out / "redteam" / "focused_correction_report.json"
@@ -2600,9 +3305,14 @@ def run_stage7_redteam(
         {
             "failures": float(failures.count()),
             "corrections": float(corrections.count()),
-            "attack_families": 1.0,
+            "attack_families": float(len({c.family for c in discovered})),
             "teacher_relabels": float(len(attack_report)),
-            "focused_correction_steps": float(len(attack_report)),
+            # Section 8 mislabel FIX: focused_correction_steps now reports the REAL
+            # optimizer-loop count (range(correction_steps)), no longer the attack
+            # count.  correction_optimizer_steps is the same value, added as the
+            # unambiguous key; the attack count remains under failures/teacher_relabels.
+            "focused_correction_steps": float(int(correction_steps)),
+            "correction_optimizer_steps": float(int(correction_steps)),
             # Phase 4.4: these are now MEASURED regression outcomes, re-executed
             # by replaying the attack states before/after the focused correction.
             "attack_match_rate_before": regression_before["match_rate"],
@@ -2611,6 +3321,15 @@ def run_stage7_redteam(
             "mean_teacher_nll_after": regression_after["mean_teacher_nll"],
             "original_attack_regression_passed": float(original_attack_regression_passed),
             "general_regression_passed": float(general_regression_passed),
+            # Workload accounting + held-out generalization (additive, numeric).
+            "attack_candidates_generated": float(len(discovered)),
+            "correction_train_cases": float(len(train_states)),
+            "heldout_same_tests": float(len(heldout_same_states)),
+            "heldout_other_tests": float(len(heldout_other_states)),
+            "arena_games_played": float(arena_games * arena_seeds),
+            "memorization_flag": float(memorization_flag),
+            "regression_delta": regression_delta,
+            "stage7_wall_clock_s": float(wall_clock_s),
             "stage7_rank_owner": 0.0,
             "stage7_write_once": 1.0,
         },
@@ -2628,8 +3347,10 @@ def run_evaluation_suite(
     *,
     out_dir: str | Path,
     num_games: int = 16,
+    seeds: list[int] | None = None,
     checkpoint: str | None = None,
     seed: int = 1,
+    profile_name: str = "SMOKE",
 ) -> dict[str, Any]:
     runtime = current_runtime()
     if runtime.is_distributed:
@@ -2643,6 +3364,8 @@ def run_evaluation_suite(
 
     from goofspiel.training.benchmark import EvaluationProfile, run_unified_benchmark, write_benchmark_report
 
+    # ``seeds=None`` reproduces the historical 3-seed behaviour exactly.
+    eval_seeds = list(seeds) if seeds else [int(seed) + i for i in range(3)]
     report_a = evaluate_bot_matchup(num_games=num_games, seed=int(seed))
     report_b = exact_feasibility_sweep(13)
     path = Path(out_dir) / "evaluation_report.json"
@@ -2657,15 +3380,20 @@ def run_evaluation_suite(
     # Phase 5: the benchmark is model-aware; E2/E6 become the trained policy's
     # REAL play vs Random when a checkpoint is supplied (never the Heuristic-vs-
     # Random reference), and G2 becomes a real robustness verdict on it.
+    # The resolved profile name flows in so QUICK/SMOKE resolve to NOT_EVALUATED
+    # (Section 9): only FULL may emit a binding PROMOTE/REJECT.
     benchmark = run_unified_benchmark(
         EvaluationProfile(
-            name="QUICK",
-            seeds=[int(seed) + i for i in range(3)],
+            name=str(profile_name or "SMOKE"),
+            seeds=eval_seeds,
             num_games=num_games,
             include_e7=False,
         ),
         checkpoint=checkpoint,
     )
+    # The directory is the fixed storage slot for this in-run evaluation; the
+    # promotion discipline (Section 9) is governed by the profile NAME inside the
+    # report, not by the path.  Keeping it stable preserves the artifact shape.
     payload["benchmark_report"] = write_benchmark_report(benchmark, Path(out_dir) / "reports" / "quick")
     payload["rank_owner"] = 0
     payload["write_once"] = True
@@ -2872,7 +3600,8 @@ def run_smoke_pipeline(
     emit("stage5_adaptive", {"ok": True, "metrics": stage5.metrics, "checkpoint": stage5.checkpoint})
     # Phase 4.3: the league plays REAL trained snapshots produced by this run:
     # P4 (robust backbone), P3 (strategic SFT), P5 (adaptive/exploiter), not
-    # role-keyed handcrafted baselines.
+    # role-keyed handcrafted baselines.  budget=None → the SMOKE preset (1/1/1),
+    # byte-preserving the historical single-game cross-play.
     stage6 = run_stage6_league(
         out_dir=out,
         role_checkpoints={
@@ -2882,14 +3611,20 @@ def run_smoke_pipeline(
         },
         n_cards=n_cards,
         seed=seed,
+        budget=Stage6Budget(),
     )
     emit("stage6_league", {"ok": True, "metrics": stage6.metrics})
     # Phase 4.4: P7 focuses a REAL correction fine-tune on the P4 robust backbone
-    # and MEASURES the attack-state regression before/after.
-    stage7 = run_stage7_redteam(out_dir=out, init_from_checkpoint=stage4.checkpoint, n_cards=n_cards, seed=seed)
+    # and MEASURES the attack-state regression before/after.  budget=None → the
+    # SMOKE preset (3 attacks all in train, no held-out, no arena).
+    stage7 = run_stage7_redteam(
+        out_dir=out, init_from_checkpoint=stage4.checkpoint, n_cards=n_cards, seed=seed,
+        budget=Stage7Budget(),
+    )
     emit("stage7_redteam", {"ok": True, "metrics": stage7.metrics})
     evaluation = run_evaluation_suite(
-        out_dir=out / "evaluation", num_games=max(2, num_corpus_games), checkpoint=stage4.checkpoint, seed=seed
+        out_dir=out / "evaluation", num_games=max(2, num_corpus_games), checkpoint=stage4.checkpoint, seed=seed,
+        profile_name="SMOKE",
     )
     emit("evaluate", {"ok": True, "metrics": evaluation})
 

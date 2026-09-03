@@ -24,22 +24,36 @@ parents can execute a certifying rerun without re-deriving anything.
 
 ## 1. Code SHAs (the only intended variable)
 
-| role | git commit | `goofspiel/training/stages.py` sha256 |
+| role | git commit | `goofspiel/training/stages.py` sha256 (git blob, LF) |
 |---|---|---|
-| **buggy** (rerun567 lineage) | `7366c85bc812d7c83c6b787dafd1896227d1b566` | `659ce37e1d1b63d622eb09c8d69909b2d2b6707e0714d93c064b5271f57e1a86` |
-| **fixed** (S7-F1) | `7de8fd20e72e007c32f50baf99683db7512f971c` | `b5e37a785eb495dba6d4aa7560e22b6015f104436eba1ffec382947e66d3be72` |
+| **buggy** (rerun567 lineage) | `7366c85bc812d7c83c6b787dafd1896227d1b566` | `5a89664d9bcc70e0b82ac8155997e20bc8823e793bffc64d6e329320805b8501` |
+| **fixed, value-slot** (S7-F1 Commit 1) | `7de8fd20e72e007c32f50baf99683db7512f971c` | `1f65a1f0dfed6b0f2a2db992faa15ebb71f9bc87725f7eff2632e4b80c2f71b7` |
+| **fixed + fail-closed guard** (S7-F1 HEAD) | `39b1fee0e6621886223bd90cb66b81dd3a061690` | `48c25c210e3fbafb48644a7a53c6c0043df7d10fdb7cfa0e13d458a0beadd28d` |
 
-The **only** difference between these two trees inside the Stage7 correction is the
-teacher-policy packing loop (`run_stage7_redteam`): positional -> value-slotted.
-Everything else on the fixed tree (LR, correction_steps, AdamW + param groups,
-frozen modules = none, replay = none, teacher anchor = none, loss coefficients, the
-`_immediate_target` Q term, attack generation, train/heldout split, attack-success
-metric, Stage7 promotion semantics, Stage6, Stage5, GPU backend, FULL budgets) is
-byte-for-byte the rerun567 configuration -- see the S7-F1 sec.10 scope guard.
+The sha256 column is the **LF-normalized git-blob** hash, reproducible on any
+platform via `git show <commit>:goofspiel/training/stages.py | sha256sum`; the git
+commit SHA is the authoritative identifier. (Earlier drafts recorded the CRLF
+working-file hashes `659ce37e...` / `b5e37a78...`; those are Windows-checkout
+artifacts and are superseded here for platform-independence.)
+
+The **only behavioral** difference between the buggy and fixed trees inside the
+Stage7 correction is the teacher-policy packing loop (`run_stage7_redteam`):
+positional -> value-slotted. The HEAD tree (`39b1fee`) additionally carries a
+fail-closed length-contract guard around that loop; the guard is a **no-op on valid
+input** -- the contract `len(teacher_policy)==len(self_actions)` is code-proven on
+both teacher branches (EXACT + REFERENCE_NASH_Q), so it can only raise if a future
+upstream change breaks the contract. The single behavioral variable on real data
+therefore remains positional->value-slot. Everything else on the fixed tree (LR,
+correction_steps, AdamW + param groups, frozen modules = none, replay = none,
+teacher anchor = none, loss coefficients, the `_immediate_target` Q term, attack
+generation, train/heldout split, attack-success metric, Stage7 promotion semantics,
+Stage6, Stage5, GPU backend, FULL budgets) is byte-for-byte the rerun567
+configuration -- see the S7-F1 sec.10 scope guard.
 
 ## 2. Recipe to produce a CERTIFYING fixed-column (when parents are on disk)
 
-1. Check out `7de8fd20e72e007c32f50baf99683db7512f971c` (the S7-F1 fix).
+1. Check out `39b1fee0e6621886223bd90cb66b81dd3a061690` (the S7-F1 fix HEAD:
+   value-slot packing + fail-closed guard).
 2. Locate rerun567's Stage4 parent (sha256 prefix `c4e06e2c`) and its fresh GPU
    Stage5 checkpoint. Verify the Stage4 sha256 matches before use.
 3. Start **Stage7 only** from that parent (do NOT re-run Stage4/5/6). Use rerun567's
@@ -48,7 +62,7 @@ byte-for-byte the rerun567 configuration -- see the S7-F1 sec.10 scope guard.
    (S7-F1 sec.29-30 -- packing is the only changed variable; eval backend must match
    rerun567, not the CPU reduced-budget tripwires in sec.8 below).
 4. Emit a new artifact `rerun567_stage7_indexfix_<timestamp>` recording
-   `buggy_code_sha=7366c85...`, `fixed_code_sha=7de8fd2...`, the parent Stage4/Stage5
+   `buggy_code_sha=7366c85...`, `fixed_code_sha=39b1fee...`, the parent Stage4/Stage5
    identities, and the **sha256 of the produced corrected checkpoint** (sec.28).
 5. Evaluate the five layers of sec.3 and fill the sec.4 table's Fixed column.
 
@@ -88,8 +102,10 @@ not fabricated.**
 ## 5. What CAN be shown now: production CODE-PATH fix evidence (NOT the sec.4 lineage)
 
 These runs exercise the **exact fixed `run_stage7_redteam` code path** on the fixed
-tree (`7de8fd2`), but at **reduced CPU budgets on a different, smaller attack set**
-(`attack_cases=6`, `correction_steps=20`, `arena_games=0`). They are the S7-F1
+tree (`39b1fee`, value-slot packing + fail-closed guard; the guard is a no-op on
+valid input so these numbers are identical to `7de8fd2`), but at **reduced CPU
+budgets on a different, smaller attack set** (`attack_cases=6`,
+`correction_steps=20`, `arena_games=0`). They are the S7-F1
 sec.19/sec.20 tripwires -- **not** the rerun567 five-layer GPU arena eval -- so they
 are reported here **separately** and are deliberately kept out of the sec.4 table.
 

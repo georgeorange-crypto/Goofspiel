@@ -50,6 +50,15 @@ from goofspiel.training.promotion import evaluate_promotion_candidate, write_pro
 from goofspiel.training.replay import TrajectoryReplayBuffer
 from goofspiel.training.redteam import CorrectionDataset, FailureBuffer
 from goofspiel.training.stage0_verify import run_stage0_verify
+from goofspiel.training.stage_control import (
+    DEFAULT_HARD_TIMEOUT_S,
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_HEARTBEAT_TIMEOUT_S,
+    Rank0Heartbeat,
+    control_dir_for,
+    current_invocation_id,
+    wait_for_rank0,
+)
 from goofspiel.training.state_coverage import coverage_report, sample_reachable_states
 from goofspiel.training.pretraining import build_pretraining_targets
 from goofspiel.training.adaptive import default_opponent_curriculum, opponent_action_for_regime, oracle_opponent_diagnostic
@@ -1823,27 +1832,112 @@ def run_stage5_adaptive(
     init_from_checkpoint: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
     logger: "TrainingLogger | None" = None,
+    heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
+    hard_timeout: float = DEFAULT_HARD_TIMEOUT_S,
+    heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_S,
 ) -> StageMetrics:
     """P5 trains the opponent/adaptive branch behind a hard firewall.
 
     Only rank0 executes the adaptive training loop and writes the checkpoint.
-    Other ranks wait at the stage barrier and then receive the exact same stage
-    result through a broadcast, so downstream state stays aligned without racing
-    the checkpoint path.
+    Stage5 is long and rank0-only, so non-rank0 ranks must NOT hold an NCCL
+    collective for its whole duration — that is the >600s watchdog deadlock the
+    control-plane replaces.  Instead rank0 publishes a heartbeat/status file
+    (see ``stage_control``) and non-rank0 ranks POLL it for liveness plus the
+    terminal result; only after rank0 reaches SUCCESS do all ranks do ONE short
+    collective (barrier) to realign the NCCL sequence number before the next
+    stage.  Failure fails closed: a crashed / hung / explicitly-FAILED rank0
+    makes peers stop waiting and raise, never block forever.
+
+    ``heartbeat_timeout`` is "how long with no fresh heartbeat before rank0 is
+    declared dead" (NOT a cap on Stage5 runtime); ``hard_timeout`` is the
+    last-resort fake-alive guard for a rank0 that keeps heartbeating but never
+    terminates.  NCCL's own timeout stays purely low-level fault protection.
+    """
+    runtime, _ = setup_torch_distributed("auto")
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    control_dir = control_dir_for(out)
+    # All ranks of THIS launch derive the same invocation id from the shared
+    # torchrun env (no collective, no clock trust); a different launch — a
+    # crash-resume / salvage / re-run into the same artifact-dir — gets a
+    # different id.  This is what lets a peer reject a prior invocation's stale
+    # SUCCESS/FAILED left in status.json instead of acting on it.
+    invocation_id = current_invocation_id()
+
+    if not runtime.is_rank0:
+        # Poll rank0's liveness instead of blocking in a collective.  Returns
+        # the SUCCESS status (carrying checkpoint + metrics); raises
+        # Stage5ControlError — fail-closed — on FAILED / stale heartbeat / hard
+        # timeout, so a dead rank0 never hangs its peers.  ``expect_invocation_id``
+        # makes a stale terminal record from an earlier invocation invisible.
+        status = wait_for_rank0(
+            control_dir,
+            expect_invocation_id=invocation_id,
+            heartbeat_timeout=heartbeat_timeout,
+            hard_timeout=hard_timeout,
+        )
+        barrier_if_distributed()
+        return StageMetrics("P5_ADAPTIVE", int(steps), dict(status.metrics), status.checkpoint)
+
+    # rank0 owns the training and every write.  It publishes STARTING, refreshes
+    # a RUNNING heartbeat through the long sub-phases, and lands on an EXPLICIT
+    # terminal state (SUCCESS with the result, or FAILED with the error) so a
+    # peer is never left guessing.  The heartbeat is a no-op unless distributed,
+    # so a single-process Stage5 is byte-identical to the old implementation.
+    heartbeat = Rank0Heartbeat(
+        control_dir,
+        enabled=runtime.is_distributed,
+        run_id=out.name,
+        invocation_id=invocation_id,
+        total_steps=max(1, int(steps)),
+        interval=heartbeat_interval,
+    )
+    heartbeat.starting()
+    try:
+        stage_metrics, ckpt_path = _run_stage5_adaptive_rank0(
+            steps=steps,
+            out=out,
+            n_cards=n_cards,
+            lr=lr,
+            seed=seed,
+            init_from_checkpoint=init_from_checkpoint,
+            resume_checkpoint=resume_checkpoint,
+            logger=logger,
+            heartbeat=heartbeat,
+        )
+        heartbeat.success(checkpoint=ckpt_path, metrics=stage_metrics)
+    except BaseException as exc:  # noqa: BLE001 - fail closed, then re-raise
+        heartbeat.fail(error=repr(exc))
+        raise
+    # rank0 reached SUCCESS: ONE short collective realigns the NCCL sequence
+    # number with the peers (which skipped every Stage5 collective), then all
+    # ranks proceed together.
+    barrier_if_distributed()
+    return StageMetrics("P5_ADAPTIVE", int(steps), stage_metrics, ckpt_path)
+
+
+def _run_stage5_adaptive_rank0(
+    *,
+    steps: int,
+    out: Path,
+    n_cards: int,
+    lr: float,
+    seed: int,
+    init_from_checkpoint: str | Path | None,
+    resume_checkpoint: str | Path | None,
+    logger: "TrainingLogger | None",
+    heartbeat: Rank0Heartbeat,
+) -> tuple[dict[str, float], str | None]:
+    """rank0-only Stage5 body: build sessions, train the adaptive branch behind
+    the firewall, write the checkpoint + gate report, and return
+    ``(stage_metrics, checkpoint_path)``.  Kept as a helper so the public
+    function can wrap it in the heartbeat try/except without re-indenting the
+    whole loop.  Refreshes the heartbeat at each long sub-phase boundary.
     """
     torch, F = _torch_import()
     from goofspiel.models import GoofspielModel
 
-    runtime, _ = setup_torch_distributed("auto")
-    if not runtime.is_rank0:
-        payload = broadcast_object(None, src=0)
-        if payload is None:
-            raise RuntimeError("stage5 payload broadcast failed")
-        barrier_if_distributed()
-        return StageMetrics("P5_ADAPTIVE", int(steps), payload["metrics"], payload["checkpoint"])
-
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    heartbeat.running(step=0, phase="session_generation", force=True)
     stage_seed = int(seed) + 503 + int(steps) + int(n_cards)
     rng = random.Random(stage_seed)
     sessions_path = out / "adaptive" / "opponent_sessions.jsonl"
@@ -1907,6 +2001,7 @@ def run_stage5_adaptive(
     )
     model.set_robust_requires_grad(False)
 
+    heartbeat.running(step=0, phase="tensor_build", force=True)
     tensors = _build_adaptive_training_tensors(session_rows, max_cards=13, device="cpu")
     if tensors is None:
         raise RuntimeError("P5 produced no training rows from the opponent sessions")
@@ -1918,6 +2013,7 @@ def run_stage5_adaptive(
     train_steps = max(1, int(steps))
     last = {"nll": float("nan"), "acc": 0.0, "ece": 1.0, "adaptive_grad_norm": 0.0, "robust_delta": 0.0}
     model.train()
+    heartbeat.running(step=0, phase="training", force=True)
     for _step in range(train_steps):
         out_model = model(batch, current_game_history=history, long_term_memory=memory)
         logits = out_model.opponent_fused_logits
@@ -1941,6 +2037,10 @@ def run_stage5_adaptive(
             acc = float((probs.argmax(dim=-1) == target_t).float().mean())
             ece = _expected_calibration_error(probs, target_t)
         last = {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm, "robust_delta": 0.0}
+        # Interval-gated heartbeat: cheap to call every step (only writes when
+        # the wall-clock interval has elapsed), so a slow CPU step and a fast
+        # GPU step refresh liveness at the same cadence.
+        heartbeat.running(step=_step + 1, phase="training")
         if logger is not None and _should_log_step(_step, train_steps):
             logger.step_metrics(
                 "stage5_adaptive",
@@ -1957,6 +2057,7 @@ def run_stage5_adaptive(
     beats_uniform = last["nll"] < uniform_reference_nll
     ckpt_path = None
     ckpt = out / "stage5_adaptive.pt"
+    heartbeat.running(step=train_steps, phase="checkpoint_write", force=True)
     manifest = save_checkpoint(
         ckpt,
         model=model,
@@ -2028,17 +2129,7 @@ def run_stage5_adaptive(
         "checkpoint": ckpt_path,
     }
     (out / "adaptive" / "adaptive_gate_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    payload = {
-        "checkpoint": ckpt_path,
-        "metrics": stage_metrics,
-        "report": report,
-        "rank_owner": 0.0,
-    }
-    payload = broadcast_object(payload, src=0)
-    if payload is None:
-        raise RuntimeError("stage5 payload broadcast failed")
-    barrier_if_distributed()
-    return StageMetrics("P5_ADAPTIVE", int(steps), payload["metrics"], payload["checkpoint"])
+    return stage_metrics, ckpt_path
 
 
 def _sample_from_policy(policy: list[float], legal: list[int], rng: random.Random) -> int:

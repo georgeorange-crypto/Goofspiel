@@ -75,6 +75,16 @@ def parse_args() -> argparse.Namespace:
                    help="Crash resume: restore full training state (model+optimizer+step).")
     p.add_argument("--stage4-resume-checkpoint-interval", type=int, default=250,
                    help="Stage4 periodic crash-resume checkpoint interval in stage steps.")
+    # Stage5 control-plane liveness (Phase 1). Stage5 is long and rank0-only;
+    # non-rank0 ranks poll rank0's heartbeat file instead of blocking in an NCCL
+    # collective. These tune the fail-closed guards — NOT the NCCL timeout.
+    p.add_argument("--stage5-heartbeat-timeout", type=float, default=300.0,
+                   help="Seconds with no fresh rank0 heartbeat before Stage5 peers "
+                        "declare rank0 dead and fail closed. This is a liveness timeout, "
+                        "NOT a cap on total Stage5 runtime.")
+    p.add_argument("--stage5-hard-timeout", type=float, default=48.0 * 3600.0,
+                   help="Absolute last-resort Stage5 wait cap (seconds) guarding a rank0 "
+                        "that keeps heartbeating but never terminates (fake-alive).")
     # Phase 0.1: honest evaluation of a trained checkpoint. When supplied, the
     # script evaluates the checkpoint and exits without running any stage.
     p.add_argument("--eval-checkpoint", default=None,
@@ -99,7 +109,11 @@ def config_from_args(args: argparse.Namespace) -> TrainingRunConfig:
         dry_run=args.dry_run,
         init_from_checkpoint=args.init_from_checkpoint,
         resume_checkpoint=args.resume_checkpoint,
-        extra={"stage4_resume_checkpoint_interval": args.stage4_resume_checkpoint_interval},
+        extra={
+            "stage4_resume_checkpoint_interval": args.stage4_resume_checkpoint_interval,
+            "stage5_heartbeat_timeout": args.stage5_heartbeat_timeout,
+            "stage5_hard_timeout": args.stage5_hard_timeout,
+        },
     )
 
 

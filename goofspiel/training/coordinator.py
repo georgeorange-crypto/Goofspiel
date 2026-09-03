@@ -11,6 +11,7 @@ from typing import Any
 from .corpus import generate_random_game_corpus
 from .distributed import STAGE_SEQUENCE, broadcast_object, current_runtime, barrier_if_distributed
 from .league import ROLE_AGGRESSIVE, ROLE_EXPLOITER, ROLE_ROBUST
+from .stage_control import DEFAULT_HARD_TIMEOUT_S, DEFAULT_HEARTBEAT_TIMEOUT_S
 from ..observability import TrainingLogger
 from .stage0_verify import run_stage0_verify
 from .stages import (
@@ -277,6 +278,12 @@ class TrainingCoordinator:
                 init_from_checkpoint=init_from_checkpoint,
                 resume_checkpoint=resume,
                 logger=self.logger,
+                heartbeat_timeout=float(
+                    self.config.extra.get("stage5_heartbeat_timeout", DEFAULT_HEARTBEAT_TIMEOUT_S)
+                ),
+                hard_timeout=float(
+                    self.config.extra.get("stage5_hard_timeout", DEFAULT_HARD_TIMEOUT_S)
+                ),
             )
             return {"stage": stage, "ok": True, "metrics": asdict(metrics)}
         if stage == "stage6_league":

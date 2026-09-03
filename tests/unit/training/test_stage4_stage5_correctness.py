@@ -180,27 +180,51 @@ def test_stage4_same_seed_replays_same_trajectory_hashes(tmp_path: Path):
 
 def test_stage5_nonzero_rank_does_not_train_or_write(monkeypatch, tmp_path: Path):
     from goofspiel.training import stages as stages_mod
+    from goofspiel.training.stage_control import (
+        STATE_SUCCESS,
+        Stage5Status,
+        control_dir_for,
+        current_invocation_id,
+        write_status,
+    )
 
     monkeypatch.setenv("RANK", "1")
     monkeypatch.setenv("LOCAL_RANK", "1")
     monkeypatch.setenv("WORLD_SIZE", "2")
+    # Both "ranks" of a launch share this (as torchrun sets it); the pre-seed
+    # below stamps the SAME invocation id the non-rank0 branch will expect, so
+    # the record is accepted as belonging to THIS invocation (not a stale one).
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "unit-stage5-nonzero")
 
     def fake_setup(device="cpu"):
+        # Real rank1 runtime, but skip live process-group init — a genuine
+        # 2-process PG is exercised by tests/unit/training/test_stage5_control_plane.py,
+        # not this single-process unit test.
         runtime = stages_mod.current_runtime()
         return runtime, device
-
-    def fake_broadcast(obj, *, src=0):
-        assert obj is None
-        return {
-            "checkpoint": str(tmp_path / "stage5_adaptive.pt"),
-            "metrics": {"stage5_rank_owner": 0.0, "stage5_write_once": 1.0},
-        }
 
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("non-rank0 must not enter P5 training/write path")
 
+    # Pre-seed the control plane as if rank0 had already finished.  The non-rank0
+    # branch must read this through the REAL wait_for_rank0 / read_status control
+    # plane (NOT a mock) and return the carried result without training/writing.
+    control_dir = control_dir_for(tmp_path)
+    control_dir.mkdir(parents=True, exist_ok=True)
+    write_status(
+        control_dir,
+        Stage5Status(
+            state=STATE_SUCCESS,
+            stage_invocation_id=current_invocation_id(),
+            checkpoint=str(tmp_path / "stage5_adaptive.pt"),
+            metrics={"stage5_rank_owner": 0.0, "stage5_write_once": 1.0},
+            updated_at=1.0,
+        ),
+    )
+
+    # Only the process-group primitives are stubbed (no live PG in a unit test);
+    # the control-plane read path itself runs for real.
     monkeypatch.setattr(stages_mod, "setup_torch_distributed", fake_setup)
-    monkeypatch.setattr(stages_mod, "broadcast_object", fake_broadcast)
     monkeypatch.setattr(stages_mod, "barrier_if_distributed", lambda: None)
     monkeypatch.setattr(stages_mod, "JsonlStore", fail_if_called)
 

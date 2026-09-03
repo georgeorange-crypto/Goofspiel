@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import random
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -62,6 +64,15 @@ from goofspiel.training.stage_control import (
 from goofspiel.training.state_coverage import coverage_report, sample_reachable_states
 from goofspiel.training.pretraining import build_pretraining_targets
 from goofspiel.training.adaptive import default_opponent_curriculum, opponent_action_for_regime, oracle_opponent_diagnostic
+from goofspiel.training.stage5_data import (
+    ResolvedStage5Budget,
+    Stage5Dataset,
+    load_or_generate_dataset,
+    resolve_stage5_budget,
+    train_val_overlap_count,
+    write_sessions_jsonl,
+)
+from goofspiel.training.stage5_validation import evaluate_opponent_model
 from goofspiel.training.teachers import TeacherRouter
 
 
@@ -113,6 +124,52 @@ def _should_log_step(step: int, total: int) -> bool:
         return True
     every = max(1, total // 10)
     return step % every == 0 or step == total - 1
+
+
+def _phase3b_trajectory_step(step: int, total: int, interval: int) -> bool:
+    """Which optimizer updates get a full trajectory row (train+val+grad+walltime).
+
+    Always logs the first update (step 0) and the last update so the initial
+    descent and the terminal state are captured, plus every ``interval`` updates
+    in between.  ``interval`` is a fixed, recorded cadence (§17) so a trajectory
+    can be reconstructed and plotted without rerunning.
+    """
+    if interval <= 0:
+        return False
+    return step == 0 or step == total - 1 or ((step + 1) % interval == 0)
+
+
+def _git_provenance() -> dict[str, Any]:
+    """Best-effort git commit/branch/dirty for the Stage5 run manifest (§34).
+
+    Runs ``git`` against the directory of this source file (inside the repo) so
+    it works regardless of the process CWD.  Any failure (git absent, not a repo)
+    degrades to ``None`` rather than raising -- provenance is recorded, never
+    fabricated.
+    """
+    import subprocess
+
+    repo_dir = str(Path(__file__).resolve().parent)
+
+    def _run(args: list[str]) -> str | None:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", repo_dir, *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:  # noqa: BLE001 - provenance is best-effort
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip() or None
+
+    commit = _run(["rev-parse", "HEAD"])
+    branch = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+    status = _run(["status", "--porcelain"])
+    dirty = None if status is None else (len(status) > 0)
+    return {"git_commit": commit, "git_branch": branch, "git_dirty": dirty}
 
 
 def _sample_states(batch_size: int, *, n: int, step: int) -> list[GameState]:
@@ -1824,7 +1881,7 @@ def _expected_calibration_error(probs, targets, *, n_bins: int = 10) -> float:
 
 def run_stage5_adaptive(
     *,
-    steps: int,
+    steps: int | None = None,
     out_dir: str | Path,
     device: str = "cpu",
     n_cards: int = 5,
@@ -1836,6 +1893,23 @@ def run_stage5_adaptive(
     heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
     hard_timeout: float = DEFAULT_HARD_TIMEOUT_S,
     heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+    # Phase 3B decoupled budget (all optional).  Passing ANY of these -- or an
+    # explicit stage5_data_contract_version=2 -- selects the decoupled data
+    # contract; a bare steps= call leaves every one None and is byte-identical to
+    # the pre-Phase3B implementation (legacy contract, no held-out set, no
+    # trajectory, no torch seeding).  D=opponent_sessions, H=games_per_session,
+    # U=adaptation_steps; data_seed/optimization_seed/validation_seed decouple
+    # data identity from optimizer budget from held-out sampling.
+    opponent_sessions: int | None = None,
+    games_per_session: int | None = None,
+    adaptation_steps: int | None = None,
+    data_seed: int | None = None,
+    optimization_seed: int | None = None,
+    validation_seed: int | None = None,
+    validation_sessions: int | None = None,
+    stage5_data_contract_version: int | None = None,
+    dataset_cache_dir: str | Path | None = None,
+    trajectory_log_interval: int | None = None,
 ) -> StageMetrics:
     """P5 trains the opponent/adaptive branch behind a hard firewall.
 
@@ -1871,6 +1945,24 @@ def run_stage5_adaptive(
     # SUCCESS/FAILED left in status.json instead of acting on it.
     invocation_id = current_invocation_id()
 
+    # Reconcile the legacy single `steps` knob with the decoupled D/H/U budget.
+    # Pure function (no I/O, no collective) so peers and rank0 agree on the
+    # optimizer-update count U used for the heartbeat and StageMetrics.  In the
+    # legacy contract U == steps, so this is byte-identical to the old code.
+    resolved = resolve_stage5_budget(
+        steps=steps,
+        opponent_sessions=opponent_sessions,
+        games_per_session=games_per_session,
+        adaptation_steps=adaptation_steps,
+        n_cards=n_cards,
+        seed=seed,
+        data_seed=data_seed,
+        optimization_seed=optimization_seed,
+        validation_seed=validation_seed,
+        validation_sessions=validation_sessions,
+        contract_version=stage5_data_contract_version,
+    )
+
     if not runtime.is_rank0:
         # Poll rank0's liveness instead of blocking in a collective.  Returns
         # the SUCCESS status (carrying checkpoint + metrics); raises
@@ -1884,7 +1976,7 @@ def run_stage5_adaptive(
             hard_timeout=hard_timeout,
         )
         barrier_if_distributed()
-        return StageMetrics("P5_ADAPTIVE", int(steps), dict(status.metrics), status.checkpoint)
+        return StageMetrics("P5_ADAPTIVE", resolved.adaptation_steps, dict(status.metrics), status.checkpoint)
 
     # rank0 owns the training and every write.  It publishes STARTING, refreshes
     # a RUNNING heartbeat through the long sub-phases, and lands on an EXPLICIT
@@ -1896,22 +1988,23 @@ def run_stage5_adaptive(
         enabled=runtime.is_distributed,
         run_id=out.name,
         invocation_id=invocation_id,
-        total_steps=max(1, int(steps)),
+        total_steps=resolved.adaptation_steps,
         interval=heartbeat_interval,
     )
     heartbeat.starting()
     try:
         stage_metrics, ckpt_path = _run_stage5_adaptive_rank0(
-            steps=steps,
+            resolved=resolved,
             out=out,
             device=device,
-            n_cards=n_cards,
             lr=lr,
             seed=seed,
             init_from_checkpoint=init_from_checkpoint,
             resume_checkpoint=resume_checkpoint,
             logger=logger,
             heartbeat=heartbeat,
+            dataset_cache_dir=dataset_cache_dir,
+            trajectory_log_interval=trajectory_log_interval,
         )
         heartbeat.success(checkpoint=ckpt_path, metrics=stage_metrics)
     except BaseException as exc:  # noqa: BLE001 - fail closed, then re-raise
@@ -1921,83 +2014,118 @@ def run_stage5_adaptive(
     # number with the peers (which skipped every Stage5 collective), then all
     # ranks proceed together.
     barrier_if_distributed()
-    return StageMetrics("P5_ADAPTIVE", int(steps), stage_metrics, ckpt_path)
+    return StageMetrics("P5_ADAPTIVE", resolved.adaptation_steps, stage_metrics, ckpt_path)
 
 
 def _run_stage5_adaptive_rank0(
     *,
-    steps: int,
+    resolved: ResolvedStage5Budget,
     out: Path,
     device: str,
-    n_cards: int,
     lr: float,
     seed: int,
     init_from_checkpoint: str | Path | None,
     resume_checkpoint: str | Path | None,
     logger: "TrainingLogger | None",
     heartbeat: Rank0Heartbeat,
+    dataset_cache_dir: str | Path | None = None,
+    trajectory_log_interval: int | None = None,
 ) -> tuple[dict[str, float], str | None]:
-    """rank0-only Stage5 body: build sessions, train the adaptive branch behind
-    the firewall, write the checkpoint + gate report, and return
+    """rank0-only Stage5 body: build the (fixed) training data, train the adaptive
+    branch behind the firewall, write the checkpoint + gate report, and return
     ``(stage_metrics, checkpoint_path)``.  Kept as a helper so the public
     function can wrap it in the heartbeat try/except without re-indenting the
     whole loop.  Refreshes the heartbeat at each long sub-phase boundary.
+
+    Phase 3B: the data quantity (D opponent sessions x H games), the optimizer
+    budget (U updates) and the seeds are decoupled via ``resolved`` (see
+    :func:`resolve_stage5_budget`).  Under the legacy contract (version 1, chosen
+    when the caller passed only ``steps``) every added behaviour -- held-out
+    validation, trajectory logging, torch seeding, extra artifacts -- is disabled,
+    so the checkpoint, ``opponent_sessions.jsonl`` and gate report are
+    byte-identical to the pre-Phase3B implementation.
     """
     torch, F = _torch_import()
     from goofspiel.models import GoofspielModel
 
-    heartbeat.running(step=0, phase="session_generation", force=True)
-    stage_seed = int(seed) + 503 + int(steps) + int(n_cards)
-    rng = random.Random(stage_seed)
-    sessions_path = out / "adaptive" / "opponent_sessions.jsonl"
-    if not resume_checkpoint:
-        sessions_path.unlink(missing_ok=True)
-    sessions = JsonlStore(sessions_path)
-    session_rows = []
+    n_cards = resolved.n_cards
+    contract_version = resolved.contract_version
+    is_v2 = contract_version == 2
+    do_validation = is_v2 and resolved.validation_sessions > 0
+    traj_interval = int(trajectory_log_interval) if trajectory_log_interval else 0
+    do_trajectory = traj_interval > 0
+    adaptive_dir = out / "adaptive"
+    sessions_path = adaptive_dir / "opponent_sessions.jsonl"
+    # Curriculum is deterministic; needed for the gate report regardless of how
+    # the sessions themselves are generated (generation owns its own RNG).
     regimes = default_opponent_curriculum()
-    games_per_session = 3
-    for session_idx in range(max(1, int(steps))):
-        regime = regimes[session_idx % len(regimes)]
-        games: list[list[RoundRecord]] = []
-        for game_idx in range(games_per_session):
-            first_prize = rng.choice(list(range(1, n_cards + 1)))
-            state = GameState.initial(n_cards, current_prize=first_prize)
-            rounds = []
-            while not state.done:
-                self_action = rng.choice(state.self_actions)
-                opp_action = opponent_action_for_regime(
-                    regime.regime_id,
-                    state.opponent_actions,
-                    stake=state.stake,
-                    n_cards=n_cards,
-                    rng=rng,
-                )
-                next_prize = rng.choice(legal_cards(state.prize_mask, state.n)) if state.prize_mask else None
-                result = transition(state, self_action, opp_action, next_prize=next_prize)
-                rounds.append(
-                    RoundRecord(
-                        round_index=state.round_index,
-                        prize=state.current_prize,
-                        self_action=self_action,
-                        opponent_action=opp_action,
-                        reward_self=result.reward_self,
-                        reward_opponent=result.reward_opp,
-                        carry_in=state.carry_pool,
-                        carry_out=result.state.carry_pool,
-                        done=result.state.done,
-                    )
-                )
-                state = result.state
-            games.append(rounds)
-        session = OpponentSession(
-            session_id=f"adaptive_session_{session_idx}:seed{stage_seed}:n{n_cards}",
-            opponent_id=f"curriculum_{regime.regime_id}",
-            strategy_regime_id=regime.regime_id,
-            games=games,
+
+    # --- Fixed training dataset ------------------------------------------------
+    # data_seed is independent of U, so the SAME training set is reused verbatim
+    # across a U-sweep.  With a cache dir the first U generates+caches and later U
+    # load the identical jsonl and re-verify its content hash; without one the set
+    # is generated deterministically per run.  Either way the per-run
+    # opponent_sessions.jsonl is written exactly as legacy did (same serialisation,
+    # reset-unless-resume) so v1 is byte-identical.
+    heartbeat.running(step=0, phase="session_generation", force=True)
+    if dataset_cache_dir is not None:
+        train_dataset, _train_origin = load_or_generate_dataset(
+            dataset_cache_dir,
+            role="train",
+            contract_version=contract_version,
+            opponent_sessions=resolved.opponent_sessions,
+            games_per_session=resolved.games_per_session,
+            n_cards=n_cards,
+            data_seed=resolved.data_seed,
         )
-        sessions.append(session)
-        session_rows.append(session)
-    rounds_total = sum(len(g) for s in session_rows for g in s.games)
+    else:
+        train_dataset = Stage5Dataset.generate(
+            role="train",
+            contract_version=contract_version,
+            opponent_sessions=resolved.opponent_sessions,
+            games_per_session=resolved.games_per_session,
+            n_cards=n_cards,
+            data_seed=resolved.data_seed,
+        )
+    session_rows = train_dataset.sessions
+    write_sessions_jsonl(session_rows, sessions_path, reset=not resume_checkpoint)
+    rounds_total = train_dataset.row_count
+
+    # --- Held-out validation set (decoupled contract only) --------------------
+    val_dataset: Stage5Dataset | None = None
+    val_overlap: int | None = None
+    if do_validation:
+        heartbeat.running(step=0, phase="validation_generation", force=True)
+        if dataset_cache_dir is not None:
+            val_dataset, _val_origin = load_or_generate_dataset(
+                dataset_cache_dir,
+                role="validation",
+                contract_version=contract_version,
+                opponent_sessions=resolved.validation_sessions,
+                games_per_session=resolved.games_per_session,
+                n_cards=n_cards,
+                data_seed=resolved.validation_seed,
+            )
+        else:
+            val_dataset = Stage5Dataset.generate(
+                role="validation",
+                contract_version=contract_version,
+                opponent_sessions=resolved.validation_sessions,
+                games_per_session=resolved.games_per_session,
+                n_cards=n_cards,
+                data_seed=resolved.validation_seed,
+            )
+        # Overlap on seed-independent content: a non-zero count is a genuine leak,
+        # surfaced in the manifest/gate report and warned (never silently ignored).
+        val_overlap = train_val_overlap_count(session_rows, val_dataset.sessions)
+        if val_overlap and logger is not None:
+            logger.step_metrics(
+                "stage5_adaptive",
+                0,
+                resolved.adaptation_steps,
+                {"train_val_overlap_count": float(val_overlap)},
+            )
+
 
     model = GoofspielModel(max_cards=13).to(device)
     model.assert_partition_is_complete()
@@ -2023,7 +2151,18 @@ def _run_stage5_adaptive_rank0(
     uniform_reference_nll = float(torch.log(legal_counts).mean())
 
     robust_snapshot = [p.detach().clone() for p in model.robust_parameters()]
-    train_steps = max(1, int(steps))
+    train_steps = resolved.adaptation_steps
+    # v2 only: make training-time RNG (dropout, etc.) reproducible WITHOUT
+    # touching data generation (own random.Random(data_seed)) or model init
+    # (loaded strictly from the parent).  Legacy leaves optimization_seed None and
+    # so seeds nothing -- byte-identical.
+    if resolved.optimization_seed is not None:
+        seed_everything(resolved.optimization_seed)
+    trajectory_path = adaptive_dir / "stage5_training_curve.jsonl"
+    if do_trajectory:
+        adaptive_dir.mkdir(parents=True, exist_ok=True)
+        trajectory_path.unlink(missing_ok=True)
+    train_start_t = time.perf_counter()
     last = {"nll": float("nan"), "acc": 0.0, "ece": 1.0, "adaptive_grad_norm": 0.0, "robust_delta": 0.0}
     model.train()
     heartbeat.running(step=0, phase="training", force=True)
@@ -2061,15 +2200,88 @@ def _run_stage5_adaptive_rank0(
                 train_steps,
                 {"nll": nll, "acc": acc, "ece": ece, "adaptive_grad_norm": adaptive_grad_norm},
             )
+        # Phase 3B trajectory: a full train+val+grad+walltime row at a fixed
+        # cadence, persisted so the whole curve is plottable without a rerun.
+        # Fully guarded, no-grad, and RNG-neutral (validation snapshots+restores
+        # the RNG), and never runs in the legacy path (trajectory_log_interval
+        # defaults None), so v1 training stays byte-identical.
+        if do_trajectory and _phase3b_trajectory_step(_step, train_steps, traj_interval):
+            with torch.no_grad():
+                adaptive_param_norm = float(torch.sqrt(sum(
+                    (p.detach().float().pow(2).sum() for p in model.adaptive_parameters()),
+                    torch.tensor(0.0),
+                )))
+                periodic_robust_delta = float(sum(
+                    (a - b).abs().sum() for a, b in zip(model.robust_parameters(), robust_snapshot)
+                ))
+            elapsed = time.perf_counter() - train_start_t
+            # clip_grad_norm_ scales all grads uniformly, so the post-clip 2-norm
+            # is exactly min(preclip, clip_threshold) -- no hot-loop recompute.
+            row: dict[str, Any] = {
+                "update": _step + 1,
+                "train_nll": nll,
+                "train_accuracy": acc,
+                "train_ece": ece,
+                "adaptive_grad_norm_preclip": adaptive_grad_norm,
+                "adaptive_grad_norm_postclip": min(adaptive_grad_norm, 1.0),
+                "grad_clip_norm": 1.0,
+                "grad_finite": bool(math.isfinite(adaptive_grad_norm)),
+                "adaptive_param_norm": adaptive_param_norm,
+                "lr": float(opt.param_groups[0]["lr"]),
+                "robust_param_delta_l1": periodic_robust_delta,
+                "elapsed_s": elapsed,
+                "ms_per_update": (elapsed * 1000.0 / (_step + 1)),
+            }
+            if do_validation and val_dataset is not None:
+                row.update(evaluate_opponent_model(model, val_dataset.sessions, max_cards=13, device=device))
+            with trajectory_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False))
+                fh.write("\n")
     robust_delta = float(sum((a - b).abs().sum() for a, b in zip(model.robust_parameters(), robust_snapshot)))
     last["robust_delta"] = robust_delta
     if robust_delta != 0.0:
         raise AssertionError(f"robust params moved during P5 ({robust_delta} != 0): firewall breach")
 
+    # Final held-out snapshot for the gate report / stage metrics (one extra
+    # eval; RNG-neutral).  Trajectory already logged the last update's val row.
+    final_val: dict[str, float] | None = None
+    if do_validation and val_dataset is not None:
+        final_val = evaluate_opponent_model(model, val_dataset.sessions, max_cards=13, device=device)
+
     oracle = oracle_opponent_diagnostic(session_rows, n_cards=n_cards)
     beats_uniform = last["nll"] < uniform_reference_nll
     ckpt_path = None
     ckpt = out / "stage5_adaptive.pt"
+    games_per_session = resolved.games_per_session
+    # Legacy (v1) checkpoint config is byte-identical to the pre-Phase3B dict
+    # (legacy_steps==steps, data_seed==stage_seed, games_per_session==3); the
+    # decoupled (v2) config records the full D/H/U budget, seeds and dataset
+    # hashes so a run is fully reproducible from its own metadata.
+    if contract_version == 1:
+        ckpt_config = {
+            "steps": resolved.legacy_steps,
+            "n_cards": n_cards,
+            "lr": lr,
+            "games_per_session": games_per_session,
+            "seed": seed,
+            "stage_seed": resolved.data_seed,
+        }
+    else:
+        ckpt_config = {
+            "stage5_data_contract_version": 2,
+            "opponent_sessions": resolved.opponent_sessions,
+            "games_per_session": games_per_session,
+            "adaptation_steps": resolved.adaptation_steps,
+            "n_cards": n_cards,
+            "lr": lr,
+            "seed": seed,
+            "data_seed": resolved.data_seed,
+            "optimization_seed": resolved.optimization_seed,
+            "validation_seed": resolved.validation_seed,
+            "validation_sessions": resolved.validation_sessions,
+            "train_dataset_sha256": train_dataset.content_hash,
+            "validation_dataset_sha256": (val_dataset.content_hash if val_dataset is not None else None),
+        }
     heartbeat.running(step=train_steps, phase="checkpoint_write", force=True)
     manifest = save_checkpoint(
         ckpt,
@@ -2080,7 +2292,7 @@ def _run_stage5_adaptive_rank0(
             training_stage="P5_ADAPTIVE",
             global_step=train_steps,
             policy_version=3,
-            config={"steps": steps, "n_cards": n_cards, "lr": lr, "games_per_session": games_per_session, "seed": seed, "stage_seed": stage_seed},
+            config=ckpt_config,
             metrics={
                 "opponent_nll": last["nll"],
                 "uniform_reference_nll": uniform_reference_nll,
@@ -2100,7 +2312,7 @@ def _run_stage5_adaptive_rank0(
 
     stage_metrics = {
         "opponent_model_usable": 1.0 if beats_uniform else 0.0,
-        "opponent_sessions": float(max(1, int(steps))),
+        "opponent_sessions": float(resolved.opponent_sessions),
         "opponent_rounds": float(rounds_total),
         "opponent_nll": float(last["nll"]),
         "uniform_reference_nll": float(uniform_reference_nll),
@@ -2115,11 +2327,24 @@ def _run_stage5_adaptive_rank0(
         "stage5_rank_owner": 0.0,
         "stage5_write_once": 1.0,
     }
+    # v2-only additions (legacy dict stays byte-for-byte identical): held-out
+    # summary + explicit decoupled markers.
+    if is_v2:
+        stage_metrics["stage5_data_contract_version"] = 2.0
+        stage_metrics["adaptation_steps"] = float(resolved.adaptation_steps)
+        stage_metrics["train_dataset_row_count"] = float(train_dataset.row_count)
+        if final_val is not None:
+            stage_metrics["val_nll"] = float(final_val["val_nll"])
+            stage_metrics["val_nll_gain"] = float(final_val["val_nll_gain"])
+            stage_metrics["val_accuracy"] = float(final_val["val_accuracy"])
+            stage_metrics["val_ece"] = float(final_val["val_ece"])
+            stage_metrics["val_brier"] = float(final_val["val_brier"])
+            stage_metrics["train_val_overlap_count"] = float(val_overlap if val_overlap is not None else 0)
     report = {
         "opponent_model_usable": bool(beats_uniform),
         "gate": "OPPONENT_MODEL_TRAINED" if beats_uniform else "OPPONENT_MODEL_BELOW_UNIFORM",
         "calibration": {
-            "sessions": max(1, int(steps)),
+            "sessions": resolved.opponent_sessions,
             "games_per_session": games_per_session,
             "rounds": rounds_total,
             "opponent_nll": last["nll"],
@@ -2141,7 +2366,87 @@ def _run_stage5_adaptive_rank0(
         "session_path": str(sessions_path),
         "checkpoint": ckpt_path,
     }
+    if is_v2:
+        report["stage5_data_contract_version"] = 2
+        report["decoupled_budget"] = {
+            "opponent_sessions_D": resolved.opponent_sessions,
+            "games_per_session_H": games_per_session,
+            "adaptation_steps_U": resolved.adaptation_steps,
+            "data_seed": resolved.data_seed,
+            "optimization_seed": resolved.optimization_seed,
+            "validation_seed": resolved.validation_seed,
+            "train_dataset_sha256": train_dataset.content_hash,
+            "train_session_count": train_dataset.session_count,
+            "train_row_count": train_dataset.row_count,
+        }
+        if val_dataset is not None:
+            report["validation"] = {
+                "validation_sessions": resolved.validation_sessions,
+                "validation_dataset_sha256": val_dataset.content_hash,
+                "validation_session_count": val_dataset.session_count,
+                "validation_row_count": val_dataset.row_count,
+                "train_val_overlap_count": val_overlap,
+                "final": final_val,
+            }
     (out / "adaptive" / "adaptive_gate_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # v2 provenance/dataset/validation/optimization manifest (§34).  Legacy writes
+    # no such file, so the v1 artifact set is unchanged.
+    if is_v2:
+        provenance = _git_provenance()
+        run_manifest = {
+            "code": {
+                **provenance,
+                "torch_version": str(torch.__version__),
+                "cuda_version": getattr(torch.version, "cuda", None),
+                "device": str(device),
+            },
+            "parent": {
+                "init_checkpoint_id": lineage["init_checkpoint_id"],
+                "parent_checkpoint_id": lineage["parent_checkpoint_id"],
+                "parent_checkpoint_sha256": lineage.get("parent_checkpoint_sha256"),
+            },
+            "dataset": {
+                "stage5_data_contract_version": contract_version,
+                "opponent_sessions": resolved.opponent_sessions,
+                "games_per_session": games_per_session,
+                "n_cards": n_cards,
+                "data_seed": resolved.data_seed,
+                "train_session_count": train_dataset.session_count,
+                "train_row_count": train_dataset.row_count,
+                "train_dataset_sha256": train_dataset.content_hash,
+            },
+            "validation": (
+                {
+                    "validation_seed": resolved.validation_seed,
+                    "validation_sessions": resolved.validation_sessions,
+                    "validation_session_count": val_dataset.session_count,
+                    "validation_row_count": val_dataset.row_count,
+                    "validation_dataset_sha256": val_dataset.content_hash,
+                    "train_val_overlap_count": val_overlap,
+                }
+                if val_dataset is not None
+                else None
+            ),
+            "optimization": {
+                "adaptation_steps": resolved.adaptation_steps,
+                "optimizer": "AdamW",
+                "lr": lr,
+                "grad_clip_norm": 1.0,
+                "optimization_seed": resolved.optimization_seed,
+                "trajectory_log_interval": traj_interval if do_trajectory else None,
+            },
+        }
+        (adaptive_dir / "stage5_manifest.json").write_text(
+            json.dumps(run_manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (adaptive_dir / "train_dataset_manifest.json").write_text(
+            json.dumps(train_dataset.manifest(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        if val_dataset is not None:
+            (adaptive_dir / "validation_dataset_manifest.json").write_text(
+                json.dumps(val_dataset.manifest(), indent=2, ensure_ascii=False), encoding="utf-8"
+            )
     return stage_metrics, ckpt_path
 
 

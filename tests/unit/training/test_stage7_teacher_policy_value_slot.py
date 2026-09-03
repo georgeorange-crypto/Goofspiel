@@ -185,3 +185,59 @@ def test_teacher_policy_length_equals_self_actions_across_attacks():
         if st.self_actions != list(range(1, len(st.self_actions) + 1)):
             seen_gapped = True
     assert seen_gapped, "seed=7 attack set must contain at least one gapped mask"
+
+
+# =============================================================================
+# S7-F1 sec.9 -- the contract holds on BOTH teacher branches (EXACT + NASH)
+# =============================================================================
+def test_length_contract_holds_on_both_teacher_branches():
+    """RE-EXECUTE len(teacher_policy)==len(self_actions) directly against the REAL
+    router on states that route to BOTH label_state branches -- EXACT (<=4 legal
+    self cards) and REFERENCE_NASH_Q (>4) -- and across contiguous and gapped masks.
+    Proves the contract is not an artifact of one solver path or one arity."""
+    NASH_CONTIGUOUS = GameState.initial(13, current_prize=1)  # 13 legal -> NASH branch
+    states = [
+        CONTIGUOUS_123,   # 3 legal, contiguous -> EXACT
+        GAPPED_13,        # 2 legal, gapped     -> EXACT
+        GAPPED_23,        # 2 legal, gapped     -> EXACT
+        NASH_CONTIGUOUS,  # 13 legal            -> REFERENCE_NASH_Q
+    ]
+    sources = set()
+    for st in states:
+        sample = _ROUTER.label_state(st)
+        assert sample.teacher_policy is not None, st.self_actions
+        assert len(sample.teacher_policy) == len(st.self_actions), (
+            st.self_actions, len(sample.teacher_policy), sample.teacher_source)
+        sources.add(sample.teacher_source)
+    assert "EXACT" in sources, sources
+    assert "REFERENCE_NASH_Q" in sources, sources
+
+
+# =============================================================================
+# S7-F1 sec.1/sec.15 -- the fail-closed guard fires on a contract violation
+# =============================================================================
+def test_packing_guard_raises_on_teacher_action_length_mismatch(tmp_path, monkeypatch):
+    """RE-EXECUTE the shipped fail-closed guard: drive the REAL run_stage7_redteam
+    but force the teacher to emit a policy one element too long. The production
+    packing must raise ValueError (no silent zip-truncation). This is the permanent
+    guard that a future serialization/solver change cannot silently violate."""
+    import dataclasses
+
+    from goofspiel.training import teachers as teachers_mod
+    from goofspiel.training.budgets import Stage7Budget
+    from goofspiel.training.stages import run_stage7_redteam
+
+    real_label_state = teachers_mod.TeacherRouter.label_state
+
+    def over_long_label_state(self, state, model_q=None):
+        sample = real_label_state(self, state, model_q)
+        bad = list(sample.teacher_policy or []) + [0.0]  # len == m+1 != m
+        return dataclasses.replace(sample, teacher_policy=bad)
+
+    monkeypatch.setattr(teachers_mod.TeacherRouter, "label_state", over_long_label_state)
+
+    budget = Stage7Budget(attack_cases=3, correction_steps=5, correction_train_cases=2,
+                          heldout_attack_cases=0, arena_games=0, arena_seeds=0)
+    with pytest.raises(ValueError, match="teacher policy/action mismatch"):
+        run_stage7_redteam(out_dir=tmp_path / "s7", correction_steps=5, n_cards=13, seed=1, budget=budget)
+

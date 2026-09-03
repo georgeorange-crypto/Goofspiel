@@ -3142,8 +3142,18 @@ def run_stage7_redteam(
     # _immediate_target Q target) are globally VALUE-slotted: slot k corresponds to
     # card value k+1. Pack by card value so the KL target lands on the same slot the
     # policy head is scored on. (Positional == value only for contiguous-from-1 masks.)
+    # Fail closed: len(teacher_policy) == len(self_actions) is a design guarantee
+    # (the teacher row is solve_zero_sum_matrix over a_cards = legal_cards(self_mask)
+    # == self_actions; see teachers.py). A mismatch means the contract this packing
+    # relies on has been broken upstream -- raise rather than silently zip-truncate.
     for b, (sample, state) in enumerate(zip(train_samples, train_states)):
-        for card, prob in zip(state.self_actions, sample.teacher_policy or []):
+        probs = sample.teacher_policy or []
+        if len(probs) != len(state.self_actions):
+            raise ValueError(
+                f"teacher policy/action mismatch: "
+                f"{len(probs)} probs for {len(state.self_actions)} legal actions"
+            )
+        for card, prob in zip(state.self_actions, probs):
             teacher_policy[b, card - 1] = float(prob)
     teacher_policy = teacher_policy / teacher_policy.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)

@@ -1,0 +1,121 @@
+{
+  "config": {
+    "lr": 0.001,
+    "steps": 20,
+    "seed": 0,
+    "max_cards": 13
+  },
+  "static": {
+    "CONTIGUOUS {1,2,3}": {
+      "self_actions": [
+        1,
+        2,
+        3
+      ],
+      "teacher_source": "EXACT",
+      "teacher_card": 3,
+      "positional_mass_slot": 2,
+      "decoded_card_at_slot": 3,
+      "roundtrip_ok": true,
+      "target_on_legal_slot": true,
+      "logit_at_mass_slot": 0.0016,
+      "pi_loss": 1.0687174797058105
+    },
+    "GAPPED {1,3}": {
+      "self_actions": [
+        1,
+        3
+      ],
+      "teacher_source": "EXACT",
+      "teacher_card": 3,
+      "positional_mass_slot": 1,
+      "decoded_card_at_slot": 2,
+      "roundtrip_ok": false,
+      "target_on_legal_slot": false,
+      "logit_at_mass_slot": -1000000000.0,
+      "pi_loss": 1000000000.0
+    },
+    "GAPPED {2,3}": {
+      "self_actions": [
+        2,
+        3
+      ],
+      "teacher_source": "EXACT",
+      "teacher_card": 3,
+      "positional_mass_slot": 1,
+      "decoded_card_at_slot": 2,
+      "roundtrip_ok": false,
+      "target_on_legal_slot": true,
+      "logit_at_mass_slot": -0.0829,
+      "pi_loss": 0.6898534893989563
+    }
+  },
+  "dynamic": {
+    "CONTIGUOUS {1,2,3}": {
+      "positional": {
+        "teacher_card": 3,
+        "p_before": 0.3406,
+        "arg_before": 3,
+        "p_after": 1.0,
+        "arg_after": 3,
+        "final_loss": 0.021575113758444786,
+        "learned": true,
+        "prob_gain": 0.6594
+      },
+      "by_value": {
+        "teacher_card": 3,
+        "p_before": 0.3406,
+        "arg_before": 3,
+        "p_after": 1.0,
+        "arg_after": 3,
+        "final_loss": 0.021575113758444786,
+        "learned": true,
+        "prob_gain": 0.6594
+      }
+    },
+    "GAPPED {1,3}": {
+      "positional": {
+        "teacher_card": 3,
+        "p_before": 0.4941,
+        "arg_before": 1,
+        "p_after": 0.0,
+        "arg_after": 1,
+        "final_loss": 999994240.0,
+        "learned": false,
+        "prob_gain": -0.4941
+      },
+      "by_value": {
+        "teacher_card": 3,
+        "p_before": 0.4941,
+        "arg_before": 1,
+        "p_after": 1.0,
+        "arg_after": 3,
+        "final_loss": 0.04703826457262039,
+        "learned": true,
+        "prob_gain": 0.5059
+      }
+    },
+    "GAPPED {2,3}": {
+      "positional": {
+        "teacher_card": 3,
+        "p_before": 0.5078,
+        "arg_before": 3,
+        "p_after": 0.0,
+        "arg_after": 2,
+        "final_loss": 0.17723426222801208,
+        "learned": false,
+        "prob_gain": -0.5078
+      },
+      "by_value": {
+        "teacher_card": 3,
+        "p_before": 0.5078,
+        "arg_before": 3,
+        "p_after": 1.0,
+        "arg_after": 3,
+        "final_loss": 0.04476436227560043,
+        "learned": true,
+        "prob_gain": 0.4922
+      }
+    }
+  }
+}

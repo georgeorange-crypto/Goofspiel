@@ -1,0 +1,64 @@
+{
+  "work_unit": "S7-D1 — Focused Correction Failure Diagnosis",
+  "mode": "DIAGNOSIS_ONLY (no tuning, no production fix applied)",
+  "date": "2026-09-04",
+  "immutable_negative_baseline": {
+    "label": "rerun567",
+    "integration_commit": "7366c85bc812d7c83c6b787dafd1896227d1b566",
+    "artifact_dir": "rerun567_integration_20260904_014006",
+    "stage4_parent_sha256_prefix": "c4e06e2c",
+    "stage5": "fresh GPU checkpoint",
+    "stage7_method": "focused_correction",
+    "STAGE7_CORRECTION_RESULT": "REGRESSION",
+    "observed_metrics": {
+      "train_attack_match_rate": {"before": 0.467, "after": 0.417, "delta": -0.050},
+      "heldout_same_family": {"before": 0.500, "after": 0.325, "delta": -0.175},
+      "heldout_other_family": {"before": 0.500, "after": 0.360, "delta": -0.140},
+      "teacher_nll": {"before": 2.32, "after": 12.09},
+      "arena_delta_corrected_minus_robust": {
+        "random": {"before": 0.92, "after": -0.80},
+        "heuristic": {"before": -1.83, "after": -4.69},
+        "strong_nash": {"before": 0.42, "after": -4.84},
+        "league": {"before": 4.30, "after": -5.08},
+        "redteam": {"before": 5.46, "after": -5.00}
+      },
+      "flags": {
+        "original_attack_regression_passed": false,
+        "general_regression_passed": false,
+        "recurrence": true,
+        "memorization_flag": false
+      }
+    }
+  },
+  "audited_code": {
+    "worktree": "_s7d1_wt (sibling worktree, isolated)",
+    "HEAD": "7366c85bc812d7c83c6b787dafd1896227d1b566",
+    "branch": "stage7/s7-d1-correction-audit",
+    "note": "HEAD == integration_commit → the audited source is byte-identical to the code that produced rerun567.",
+    "primary_file": "goofspiel/training/stages.py",
+    "primary_file_sha256": "659ce37e1d1b63d622eb09c8d69909b2d2b6707e0714d93c064b5271f57e1a86",
+    "defect_site": "goofspiel/training/stages.py:3138-3142 (teacher_policy packing inside run_stage7_redteam)"
+  },
+  "root_cause": {
+    "classification": "D1-B (target/loss bug — policy target placed on the wrong action index)",
+    "co_occurring_amplifier": "objective/anchor absence: full-network AdamW on the entire 6,140,611-param model (0 frozen) with NO general replay and NO teacher anchor, despite the report advertising retain_general_replay_fraction=0.25 (dead metadata).",
+    "evidence_grade": "CODE-PROVEN + EXPERIMENTALLY CONFIRMED",
+    "excluded_by_experiment": ["D1-C optimizer instability (LR/steps/optimizer held constant across fix contrast)", "D1-D evaluation/report bug (0-step identity control is exact)"]
+  },
+  "evidence_files": {
+    "static_and_dynamic_reproducer": "stage7_diagnosis/reproduce/index_misalignment.py",
+    "reproducer_summary_json": "stage7_diagnosis/evidence/reproducer_summary.json",
+    "parameter_inventory_json": "stage7_diagnosis/audit/parameter_inventory.json",
+    "loss_contract": "stage7_diagnosis/audit/loss_contract.md",
+    "committed_tests": "tests/unit/training/test_stage7_correction_diagnosis.py",
+    "final_report": "stage7_diagnosis/DIAGNOSIS_REPORT.md"
+  },
+  "proposed_minimal_fix_NOT_APPLIED": {
+    "site": "goofspiel/training/stages.py:3139-3141",
+    "change": "pack teacher mass by CARD VALUE: for i,v in enumerate(row): teacher_policy[b, state.self_actions[i]-1] = v",
+    "status": "PROPOSED ONLY — awaiting review per S7-D1 sec.48"
+  },
+  "deferred": {
+    "stage6_antisymmetry_audit": "BLOCKED — needs rerun567 raw league_report.json, not on local disk. Recipe in DIAGNOSIS_REPORT.md sec. 'Deferred'."
+  }
+}

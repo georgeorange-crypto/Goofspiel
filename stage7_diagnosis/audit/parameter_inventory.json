@@ -1,0 +1,202 @@
+{
+  "total_parameters": 6140611,
+  "trainable_parameters": 6140611,
+  "frozen_parameters": 0,
+  "optimizer_covers_all_params": true,
+  "optimizer_param_count": 6140611,
+  "n_param_groups": 1,
+  "per_top_module": {
+    "card_transformer": {
+      "params": 1779456,
+      "n_tensors": 48,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "matrix_blocks": {
+      "params": 665088,
+      "n_tensors": 24,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "adaptive_cnn": {
+      "params": 590848,
+      "n_tensors": 12,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "intra_game_lstm": {
+      "params": 543744,
+      "n_tensors": 8,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "opp_fused_head": {
+      "params": 443908,
+      "n_tensors": 16,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "inter_game_mamba": {
+      "params": 261696,
+      "n_tensors": 13,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "adaptive_value_head": {
+      "params": 182985,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "global_fusion": {
+      "params": 181056,
+      "n_tensors": 6,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "pair_projector": {
+      "params": 174368,
+      "n_tensors": 6,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "memory_fusion": {
+      "params": 148224,
+      "n_tensors": 6,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "value_head": {
+      "params": 133833,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "opp_short_head": {
+      "params": 110977,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "opp_long_head": {
+      "params": 110977,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "card_gate": {
+      "params": 110784,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "policy_head": {
+      "params": 98689,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "adaptive_policy_head": {
+      "params": 98689,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "matrix_in": {
+      "params": 83040,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "card_projector": {
+      "params": 50688,
+      "n_tensors": 6,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "gnn_layers": {
+      "params": 50304,
+      "n_tensors": 12,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "adaptive_film": {
+      "params": 49408,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "node_projector": {
+      "params": 37248,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "t_to_action": {
+      "params": 37056,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "game_summary_projector": {
+      "params": 37056,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "q_head": {
+      "params": 33284,
+      "n_tensors": 16,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "adaptive_delta_heads": {
+      "params": 33284,
+      "n_tensors": 16,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "global_encoder": {
+      "params": 26560,
+      "n_tensors": 6,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "history_projector": {
+      "params": 25344,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "g_to_action": {
+      "params": 24768,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "matrix_out": {
+      "params": 12416,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "rank_encoder": {
+      "params": 4608,
+      "n_tensors": 4,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "gnn_global": {
+      "params": 129,
+      "n_tensors": 2,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    },
+    "role_embed": {
+      "params": 96,
+      "n_tensors": 1,
+      "requires_grad_all": true,
+      "in_optimizer_all": true
+    }
+  }
+}
